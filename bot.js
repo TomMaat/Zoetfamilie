@@ -1,4 +1,6 @@
 const http = require('http');
+const fs = require('fs');
+const path = require('path');
 const {
     Client,
     GatewayIntentBits,
@@ -36,8 +38,31 @@ const CONFIG = {
 
     SNAP_CHANNEL_ID: '1567284467347751042',
     SNAP_ROLE_ID: '1559951158951419954',
-    SNAP_BUTTON_ID: 'snap_ping_click'
+    SNAP_BUTTON_ID: 'snap_ping_click',
+
+    HONEYPOT_CHANNEL_ID: '1567295355740229733'
 };
+
+// Bestand voor het bijhouden van kicks (overleeft herstart via Render disk? nee, maar in-memory is ok)
+const KICK_FILE = path.join(__dirname, 'kicks.json');
+
+function loadKicks() {
+    try {
+        return JSON.parse(fs.readFileSync(KICK_FILE, 'utf8'));
+    } catch {
+        return { total: 0 };
+    }
+}
+
+function saveKicks(data) {
+    try {
+        fs.writeFileSync(KICK_FILE, JSON.stringify(data, null, 2));
+    } catch (err) {
+        console.error('Kon kicks niet opslaan:', err);
+    }
+}
+
+let kickData = loadKicks();
 
 const client = new Client({
     intents: [
@@ -56,7 +81,6 @@ function getOrdinal(n) {
     return s[(v - 20) % 10] || s[v] || s[0];
 }
 
-// Zorgt dat alle members in de cache zitten, dan tellen
 async function countRoleMembers(guild, roleId) {
     try {
         await guild.members.fetch();
@@ -110,7 +134,11 @@ client.once('clientReady', async () => {
                         .setMinValue(1)
                         .setMaxValue(100)
                 )
-                .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
+                .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+            new SlashCommandBuilder()
+                .setName('kicks')
+                .setDescription('Bekijk het totaal aantal honeypot kicks')
+                .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
         ].map(c => c.toJSON());
 
         await client.application.commands.set(commands);
@@ -135,7 +163,8 @@ client.once('clientReady', async () => {
 
             const button = new ButtonBuilder()
                 .setCustomId(CONFIG.VERIFY_BUTTON_ID)
-                .setLabel(`✅ Verified — ${verifyCount}`)
+                .setLabel(`${verifyCount}`)
+                .setEmoji('✅')
                 .setStyle(ButtonStyle.Success);
 
             const row = new ActionRowBuilder().addComponents(button);
@@ -165,7 +194,8 @@ client.once('clientReady', async () => {
 
             const button = new ButtonBuilder()
                 .setCustomId(CONFIG.SNAP_BUTTON_ID)
-                .setLabel(`👻 Snapchat Ping — ${snapCount}`)
+                .setLabel(`${snapCount}`)
+                .setEmoji('👻')
                 .setStyle(ButtonStyle.Primary);
 
             const row = new ActionRowBuilder().addComponents(button);
@@ -174,6 +204,29 @@ client.once('clientReady', async () => {
         }
     } catch (err) {
         console.error('Fout bij snapchat panel:', err);
+    }
+
+    // Honeypot waarschuwing sturen
+    try {
+        const honeyChannel = await client.channels.fetch(CONFIG.HONEYPOT_CHANNEL_ID);
+        if (honeyChannel) {
+            await cleanupOldPanels(honeyChannel, 'This is a honeypot channel');
+
+            const embed = new EmbedBuilder()
+                .setTitle('🍯 This is a honeypot channel!')
+                .setDescription(
+                    '⚡ **Action taken:** KICK\n\n' +
+                    '**DO NOT POST HERE** - ANY message, image, attachment or sticker posted here will get you kicked **instantly**, no exceptions!\n\n' +
+                    '🛡️ **This channel is monitored automatically 24/7**'
+                )
+                .setColor('#f7c948')
+                .setThumbnail(CONFIG.LOGO_URL);
+
+            await honeyChannel.send({ embeds: [embed] });
+            console.log('Honeypot waarschuwing gestuurd');
+        }
+    } catch (err) {
+        console.error('Fout bij honeypot panel:', err);
     }
 });
 
@@ -208,6 +261,40 @@ client.on('guildMemberRemove', (member) => {
     updateStatus(member.guild);
 });
 
+// --- HONEYPOT ---
+client.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+    if (message.channel.id !== CONFIG.HONEYPOT_CHANNEL_ID) return;
+
+    // Bericht meteen verwijderen
+    await message.delete().catch(() => {});
+
+    const member = message.member;
+    if (!member) return;
+
+    // Kick (geen ban, zoals gevraagd)
+    try {
+        await member.kick('Honeypot channel - posted a message');
+        kickData.total += 1;
+        saveKicks(kickData);
+
+        // Melding in het honeypot kanaal
+        const embed = new EmbedBuilder()
+            .setTitle('🍯 Honeypot triggered')
+            .setDescription(
+                `**User:** ${message.author.tag} (\`${message.author.id}\`)\n` +
+                `**Action:** KICK\n` +
+                `**Total kicks:** ${kickData.total}`
+            )
+            .setColor('#e74c3c')
+            .setTimestamp();
+
+        await message.channel.send({ embeds: [embed] }).catch(() => {});
+    } catch (err) {
+        console.error('Fout bij honeypot kick:', err);
+    }
+});
+
 // --- INTERACTIONS ---
 client.on('interactionCreate', async (interaction) => {
 
@@ -226,6 +313,13 @@ client.on('interactionCreate', async (interaction) => {
                 console.error('Fout bij clear:', err);
                 await interaction.reply({ content: 'Kon de berichten niet verwijderen. Berichten ouder dan 14 dagen kunnen niet verwijderd worden.', flags: MessageFlags.Ephemeral });
             }
+        }
+
+        if (interaction.commandName === 'kicks') {
+            return interaction.reply({
+                content: `Totaal aantal honeypot kicks: **${kickData.total}**`,
+                flags: MessageFlags.Ephemeral
+            });
         }
         return;
     }
@@ -250,7 +344,8 @@ client.on('interactionCreate', async (interaction) => {
             const newRow = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId(CONFIG.VERIFY_BUTTON_ID)
-                    .setLabel(`✅ Verified — ${newCount}`)
+                    .setLabel(`${newCount}`)
+                    .setEmoji('✅')
                     .setStyle(ButtonStyle.Success)
             );
             await interaction.message.edit({ components: [newRow] }).catch(() => {});
@@ -283,7 +378,8 @@ client.on('interactionCreate', async (interaction) => {
             const newRow = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId(CONFIG.SNAP_BUTTON_ID)
-                    .setLabel(`👻 Snapchat Ping — ${newCount}`)
+                    .setLabel(`${newCount}`)
+                    .setEmoji('👻')
                     .setStyle(ButtonStyle.Primary)
             );
             await interaction.message.edit({ components: [newRow] }).catch(() => {});
