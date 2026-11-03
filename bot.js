@@ -74,12 +74,6 @@ const client = new Client({
 });
 
 // --- HELPERS ---
-function getOrdinal(n) {
-    const s = ['th', 'st', 'nd', 'rd'];
-    const v = n % 100;
-    return s[(v - 20) % 10] || s[v] || s[0];
-}
-
 async function countRoleMembers(guild, roleId) {
     try {
         await guild.members.fetch();
@@ -108,9 +102,51 @@ async function cleanupOldPanels(channel, markerText) {
     }
 }
 
+async function clearChannel(channel) {
+    try {
+        let fetched;
+        do {
+            fetched = await channel.messages.fetch({ limit: 100 });
+            if (fetched.size === 0) break;
+            for (const msg of fetched.values()) {
+                await msg.delete().catch(() => {});
+            }
+        } while (fetched.size > 0);
+    } catch (err) {
+        console.error('Fout bij leegmaken kanaal:', err);
+    }
+}
+
 function updateStatus(guild) {
     if (!guild) return;
     client.user.setActivity(`${guild.memberCount} leden`, { type: ActivityType.Watching });
+}
+
+// Zoekt het panel-bericht in een kanaal en update de knop met het huidige aantal
+async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
+    try {
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) return;
+        const messages = await channel.messages.fetch({ limit: 20 });
+        const panel = messages.find(m =>
+            m.author.id === client.user.id &&
+            m.components.length > 0 &&
+            m.components[0].components.some(b => b.customId === buttonId)
+        );
+        if (!panel) return;
+
+        const count = await countRoleMembers(channel.guild, roleId);
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(buttonId)
+                .setLabel(`${count}`)
+                .setEmoji(emoji)
+                .setStyle(style)
+        );
+        await panel.edit({ components: [row] }).catch(() => {});
+    } catch (err) {
+        console.error('Fout bij refresh panel:', err);
+    }
 }
 
 // --- BOT ONLINE ---
@@ -205,11 +241,12 @@ client.once('clientReady', async () => {
         console.error('Fout bij snapchat panel:', err);
     }
 
-    // Honeypot waarschuwing sturen
+    // Honeypot
     try {
         const honeyChannel = await client.channels.fetch(CONFIG.HONEYPOT_CHANNEL_ID);
         if (honeyChannel) {
-            await cleanupOldPanels(honeyChannel, 'honeypot kanaal');
+            await clearChannel(honeyChannel);
+            console.log('Honeypot kanaal leeggemaakt');
 
             const embed = new EmbedBuilder()
                 .setTitle('🍯 Dit is een honeypot kanaal!')
@@ -240,13 +277,11 @@ client.on('guildMemberAdd', async (member) => {
         const memberCount = member.guild.memberCount;
 
         const embed = new EmbedBuilder()
-            .setTitle(`Welkom bij ${CONFIG.SERVER_NAME}!`)
             .setDescription(
-                `Hey ${member}, welkom bij **${CONFIG.SERVER_NAME}**!\n\n` +
-                `Je bent het **${memberCount}${getOrdinal(memberCount)}** lid van de server.\n\n` +
-                `Ga naar <#${CONFIG.VERIFY_CHANNEL_ID}> om jezelf te verifiëren.`
+                `Welkom ${member}!\n` +
+                `Je bent lid **${memberCount}e** van **${CONFIG.SERVER_NAME}**.`
             )
-            .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+            .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
             .setColor('#2b2d31')
             .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
 
@@ -256,8 +291,32 @@ client.on('guildMemberAdd', async (member) => {
     }
 });
 
-client.on('guildMemberRemove', (member) => {
+client.on('guildMemberRemove', async (member) => {
     updateStatus(member.guild);
+
+    // Als het lid een van de rollen had, teller omlaag
+    const hadVerify = member.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
+    const hadSnap = member.roles.cache.has(CONFIG.SNAP_ROLE_ID);
+
+    if (hadVerify) {
+        await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
+    }
+    if (hadSnap) {
+        await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
+    }
+});
+
+// Rol eraf -> teller omlaag
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+    const lostVerify = oldMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID) && !newMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
+    const lostSnap = oldMember.roles.cache.has(CONFIG.SNAP_ROLE_ID) && !newMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
+
+    if (lostVerify) {
+        await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
+    }
+    if (lostSnap) {
+        await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
+    }
 });
 
 // --- HONEYPOT ---
@@ -265,13 +324,11 @@ client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     if (message.channel.id !== CONFIG.HONEYPOT_CHANNEL_ID) return;
 
-    // Bericht meteen verwijderen
     await message.delete().catch(() => {});
 
     const member = message.member;
     if (!member) return;
 
-    // Kick
     try {
         await member.kick('Honeypot kanaal - bericht geplaatst');
         kickData.total += 1;
