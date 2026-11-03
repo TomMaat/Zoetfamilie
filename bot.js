@@ -12,7 +12,8 @@ const {
     PermissionFlagsBits,
     SlashCommandBuilder,
     ActivityType,
-    MessageFlags
+    MessageFlags,
+    AuditLogEvent
 } = require('discord.js');
 
 // --- KLEINE HTTP SERVER ZODAT RENDER EEN POORT ZIET ---
@@ -42,35 +43,58 @@ const CONFIG = {
 
     HONEYPOT_CHANNEL_ID: '1567295355740229733',
 
-    LOG_CHANNEL_ID: '1567299300436746310'
+    LOG_CHANNEL_ID: '1567299300436746310',
+
+    ANTINUKE_ALLOWED_USERS: [
+        '1033753872927293520',
+        '1559586201348866050'
+    ],
+
+    ANTINUKE_LIMITS: {
+        channelDelete: 3,
+        roleDelete: 3,
+        banAdd: 3,
+        kickAdd: 3,
+        memberRoleUpdate: 10
+    },
+    ANTINUKE_WINDOW_MS: 10000
 };
 
 const KICK_FILE = path.join(__dirname, 'kicks.json');
+const ANTINUKE_FILE = path.join(__dirname, 'antinuke.json');
 
-function loadKicks() {
+function loadJson(file, fallback) {
     try {
-        return JSON.parse(fs.readFileSync(KICK_FILE, 'utf8'));
+        return JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch {
-        return { total: 0 };
+        return fallback;
     }
 }
 
-function saveKicks(data) {
+function saveJson(file, data) {
     try {
-        fs.writeFileSync(KICK_FILE, JSON.stringify(data, null, 2));
+        fs.writeFileSync(file, JSON.stringify(data, null, 2));
     } catch (err) {
-        console.error('Kon kicks niet opslaan:', err);
+        console.error(`Kon ${file} niet opslaan:`, err);
     }
 }
 
-let kickData = loadKicks();
+let kickData = loadJson(KICK_FILE, { total: 0 });
+
+// Anti-nuke standaard AAN. Alleen als het bestand expliciet false bevat, blijft het uit.
+let antinukeData = loadJson(ANTINUKE_FILE, { enabled: true });
+if (typeof antinukeData.enabled !== 'boolean') antinukeData.enabled = true;
+saveJson(ANTINUKE_FILE, antinukeData);
+
+const actionTracker = new Map();
 
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildModeration
     ],
     partials: [Partials.Channel, Partials.Message]
 });
@@ -170,14 +194,78 @@ async function sendLog(guild, { title, description, color, thumbnail }) {
     }
 }
 
+// --- ANTI-NUKE ---
+function checkThreshold(userId, type) {
+    const key = `${userId}:${type}`;
+    const now = Date.now();
+    const list = (actionTracker.get(key) || []).filter(t => now - t < CONFIG.ANTINUKE_WINDOW_MS);
+    list.push(now);
+    actionTracker.set(key, list);
+    const limit = CONFIG.ANTINUKE_LIMITS[type] || 999;
+    return list.length >= limit;
+}
+
+async function findExecutor(guild, type, targetId) {
+    try {
+        const logs = await guild.fetchAuditLogs({ type, limit: 5 });
+        const entry = logs.entries.find(e =>
+            (!targetId || e.target?.id === targetId) &&
+            Date.now() - e.createdTimestamp < 15000
+        );
+        return entry ? entry.executor : null;
+    } catch (err) {
+        console.error('Fout bij audit logs:', err);
+        return null;
+    }
+}
+
+async function punishUser(guild, userId, reason) {
+    try {
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (!member) return;
+
+        const removable = member.roles.cache.filter(r =>
+            r.id !== guild.id && guild.members.me.roles.highest.position > r.position
+        );
+        if (removable.size > 0) {
+            await member.roles.remove(removable, `Anti-nuke: ${reason}`).catch(() => {});
+        }
+
+        await member.kick(`Anti-nuke: ${reason}`).catch(() => {});
+
+        await sendLog(guild, {
+            title: '🚨 Anti-nuke actie',
+            description: `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n**Reden:** ${reason}`,
+            color: '#e74c3c',
+            thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
+        });
+    } catch (err) {
+        console.error('Fout bij straffen user:', err);
+    }
+}
+
+async function handleNukeAction(guild, type, targetId) {
+    if (!antinukeData.enabled) return;
+
+    const executor = await findExecutor(guild, type, targetId);
+    if (!executor) return;
+
+    if (executor.id === client.user.id) return;
+    if (CONFIG.ANTINUKE_ALLOWED_USERS.includes(executor.id)) return;
+
+    if (checkThreshold(executor.id, type)) {
+        await punishUser(guild, executor.id, `Te veel ${type} acties binnen ${CONFIG.ANTINUKE_WINDOW_MS / 1000}s`);
+    }
+}
+
 // --- BOT ONLINE ---
 client.once('clientReady', async () => {
     console.log(`Ingelogd als ${client.user.tag}`);
+    console.log(`Anti-nuke: ${antinukeData.enabled ? 'AAN' : 'UIT'}`);
 
     const guild = client.guilds.cache.first();
     if (guild) updateStatus(guild);
 
-    // Slash commands
     try {
         const commands = [
             new SlashCommandBuilder()
@@ -194,7 +282,19 @@ client.once('clientReady', async () => {
             new SlashCommandBuilder()
                 .setName('kicks')
                 .setDescription('Bekijk het totaal aantal honeypot kicks')
-                .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
+                .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
+            new SlashCommandBuilder()
+                .setName('antinuke')
+                .setDescription('Zet het anti-nuke systeem aan of uit')
+                .addStringOption(opt =>
+                    opt.setName('actie')
+                        .setDescription('enable of disable')
+                        .setRequired(true)
+                        .addChoices(
+                            { name: 'enable', value: 'enable' },
+                            { name: 'disable', value: 'disable' }
+                        )
+                )
         ].map(c => c.toJSON());
 
         await client.application.commands.set(commands);
@@ -203,7 +303,6 @@ client.once('clientReady', async () => {
         console.error('Fout bij registreren commands:', err);
     }
 
-    // Verify panel
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
@@ -231,7 +330,6 @@ client.once('clientReady', async () => {
         console.error('Fout bij verify panel:', err);
     }
 
-    // Snapchat panel
     try {
         const snapChannel = await client.channels.fetch(CONFIG.SNAP_CHANNEL_ID);
         if (snapChannel) {
@@ -262,7 +360,6 @@ client.once('clientReady', async () => {
         console.error('Fout bij snapchat panel:', err);
     }
 
-    // Honeypot
     try {
         const honeyChannel = await client.channels.fetch(CONFIG.HONEYPOT_CHANNEL_ID);
         if (honeyChannel) {
@@ -337,6 +434,16 @@ client.on('guildMemberRemove', async (member) => {
             thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     }
+
+    if (!antinukeData.enabled) return;
+    const executor = await findExecutor(member.guild, AuditLogEvent.MemberKick, member.id);
+    if (!executor) return;
+    if (executor.id === client.user.id) return;
+    if (CONFIG.ANTINUKE_ALLOWED_USERS.includes(executor.id)) return;
+
+    if (checkThreshold(executor.id, 'kickAdd')) {
+        await punishUser(member.guild, executor.id, `Te veel kicks binnen ${CONFIG.ANTINUKE_WINDOW_MS / 1000}s`);
+    }
 });
 
 // --- ROLLEN: ADD / REMOVE LOGS ---
@@ -346,7 +453,6 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const oldSnap = oldMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
     const newSnap = newMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
 
-    // Verify
     if (!oldVerify && newVerify) {
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
         await sendLog(newMember.guild, {
@@ -365,7 +471,6 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
         });
     }
 
-    // Snapchat
     if (!oldSnap && newSnap) {
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
         await sendLog(newMember.guild, {
@@ -385,6 +490,21 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     }
 });
 
+// --- ANTI-NUKE EVENTS ---
+client.on('channelDelete', async (channel) => {
+    if (!channel.guild) return;
+    await handleNukeAction(channel.guild, 'channelDelete', channel.id);
+});
+
+client.on('roleDelete', async (role) => {
+    if (!role.guild) return;
+    await handleNukeAction(role.guild, 'roleDelete', role.id);
+});
+
+client.on('guildBanAdd', async (ban) => {
+    await handleNukeAction(ban.guild, 'banAdd', ban.user.id);
+});
+
 // --- HONEYPOT ---
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
@@ -398,7 +518,7 @@ client.on('messageCreate', async (message) => {
     try {
         await member.kick('Honeypot kanaal - bericht geplaatst');
         kickData.total += 1;
-        saveKicks(kickData);
+        saveJson(KICK_FILE, kickData);
 
         const embed = new EmbedBuilder()
             .setTitle('🍯 Honeypot geactiveerd')
@@ -442,12 +562,47 @@ client.on('interactionCreate', async (interaction) => {
                 flags: MessageFlags.Ephemeral
             });
         }
+
+        if (interaction.commandName === 'antinuke') {
+            if (!CONFIG.ANTINUKE_ALLOWED_USERS.includes(interaction.user.id)) {
+                return interaction.reply({ content: 'Je hebt geen toestemming om dit te gebruiken.', flags: MessageFlags.Ephemeral });
+            }
+
+            const actie = interaction.options.getString('actie');
+
+            if (actie === 'enable') {
+                if (antinukeData.enabled) {
+                    return interaction.reply({ content: 'Anti-nuke is al ingeschakeld.', flags: MessageFlags.Ephemeral });
+                }
+                antinukeData.enabled = true;
+                saveJson(ANTINUKE_FILE, antinukeData);
+                await sendLog(interaction.guild, {
+                    title: '🛡️ Anti-nuke ingeschakeld',
+                    description: `Ingeschakeld door ${interaction.user.tag}.`,
+                    color: '#2ecc71'
+                });
+                return interaction.reply({ content: 'Anti-nuke is nu **ingeschakeld**.', flags: MessageFlags.Ephemeral });
+            }
+
+            if (actie === 'disable') {
+                if (!antinukeData.enabled) {
+                    return interaction.reply({ content: 'Anti-nuke is al uitgeschakeld.', flags: MessageFlags.Ephemeral });
+                }
+                antinukeData.enabled = false;
+                saveJson(ANTINUKE_FILE, antinukeData);
+                await sendLog(interaction.guild, {
+                    title: '🛡️ Anti-nuke uitgeschakeld',
+                    description: `Uitgeschakeld door ${interaction.user.tag}.`,
+                    color: '#e74c3c'
+                });
+                return interaction.reply({ content: 'Anti-nuke is nu **uitgeschakeld**.', flags: MessageFlags.Ephemeral });
+            }
+        }
         return;
     }
 
     if (!interaction.isButton()) return;
 
-    // Verify knop
     if (interaction.customId === CONFIG.VERIFY_BUTTON_ID) {
         try {
             const role = interaction.guild.roles.cache.get(CONFIG.VERIFY_ROLE_ID);
@@ -481,7 +636,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
-    // Snapchat knop
     if (interaction.customId === CONFIG.SNAP_BUTTON_ID) {
         try {
             const role = interaction.guild.roles.cache.get(CONFIG.SNAP_ROLE_ID);
