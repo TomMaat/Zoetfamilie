@@ -43,7 +43,6 @@ const CONFIG = {
     HONEYPOT_CHANNEL_ID: '1567295355740229733'
 };
 
-// Bestand voor het bijhouden van kicks (overleeft herstart via Render disk? nee, maar in-memory is ok)
 const KICK_FILE = path.join(__dirname, 'kicks.json');
 
 function loadKicks() {
@@ -210,14 +209,14 @@ client.once('clientReady', async () => {
     try {
         const honeyChannel = await client.channels.fetch(CONFIG.HONEYPOT_CHANNEL_ID);
         if (honeyChannel) {
-            await cleanupOldPanels(honeyChannel, 'This is a honeypot channel');
+            await cleanupOldPanels(honeyChannel, 'honeypot kanaal');
 
             const embed = new EmbedBuilder()
-                .setTitle('🍯 This is a honeypot channel!')
+                .setTitle('🍯 Dit is een honeypot kanaal!')
                 .setDescription(
-                    '⚡ **Action taken:** KICK\n\n' +
-                    '**DO NOT POST HERE** - ANY message, image, attachment or sticker posted here will get you kicked **instantly**, no exceptions!\n\n' +
-                    '🛡️ **This channel is monitored automatically 24/7**'
+                    '⚡ **Actie:** KICK\n\n' +
+                    '**PLAATS HIER NIETS** - Elk bericht, elke afbeelding, bijlage of sticker die hier geplaatst wordt, zorgt ervoor dat je **direct** gekickt wordt. Geen uitzonderingen!\n\n' +
+                    '🛡️ **Dit kanaal wordt 24/7 automatisch gecontroleerd**'
                 )
                 .setColor('#f7c948')
                 .setThumbnail(CONFIG.LOGO_URL);
@@ -272,19 +271,18 @@ client.on('messageCreate', async (message) => {
     const member = message.member;
     if (!member) return;
 
-    // Kick (geen ban, zoals gevraagd)
+    // Kick
     try {
-        await member.kick('Honeypot channel - posted a message');
+        await member.kick('Honeypot kanaal - bericht geplaatst');
         kickData.total += 1;
         saveKicks(kickData);
 
-        // Melding in het honeypot kanaal
         const embed = new EmbedBuilder()
-            .setTitle('🍯 Honeypot triggered')
+            .setTitle('🍯 Honeypot geactiveerd')
             .setDescription(
-                `**User:** ${message.author.tag} (\`${message.author.id}\`)\n` +
-                `**Action:** KICK\n` +
-                `**Total kicks:** ${kickData.total}`
+                `**Gebruiker:** ${message.author.tag} (\`${message.author.id}\`)\n` +
+                `**Actie:** KICK\n` +
+                `**Totaal kicks:** ${kickData.total}`
             )
             .setColor('#e74c3c')
             .setTimestamp();
