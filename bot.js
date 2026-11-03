@@ -7,7 +7,8 @@ const {
     ButtonStyle,
     EmbedBuilder,
     PermissionFlagsBits,
-    SlashCommandBuilder
+    SlashCommandBuilder,
+    ActivityType
 } = require('discord.js');
 
 // --- INSTELLINGEN ---
@@ -40,9 +41,49 @@ const client = new Client({
     partials: [Partials.Channel, Partials.Message]
 });
 
+// --- HELPERS ---
+function getOrdinal(n) {
+    const s = ['th', 'st', 'nd', 'rd'];
+    const v = n % 100;
+    return s[(v - 20) % 10] || s[v] || s[0];
+}
+
+function countRoleMembers(guild, roleId) {
+    const role = guild.roles.cache.get(roleId);
+    if (!role) return 0;
+    return role.members.size;
+}
+
+async function cleanupOldPanels(channel, markerText) {
+    try {
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const old = messages.filter(m =>
+            m.author.id === client.user.id &&
+            m.embeds.length > 0 &&
+            m.embeds[0].description &&
+            m.embeds[0].description.includes(markerText)
+        );
+        for (const msg of old.values()) {
+            await msg.delete().catch(() => {});
+        }
+    } catch (err) {
+        console.error('Fout bij opruimen oude panels:', err);
+    }
+}
+
+// Update bot status met aantal leden
+function updateStatus(guild) {
+    if (!guild) return;
+    client.user.setActivity(`${guild.memberCount} leden`, { type: ActivityType.Watching });
+}
+
 // --- BOT ONLINE ---
 client.once('ready', async () => {
     console.log(`Ingelogd als ${client.user.tag}`);
+
+    // Status zetten
+    const guild = client.guilds.cache.first();
+    if (guild) updateStatus(guild);
 
     // Slash commands registreren
     try {
@@ -66,10 +107,14 @@ client.once('ready', async () => {
         console.error('Fout bij registreren commands:', err);
     }
 
-    // Verify panel sturen
+    // Verify panel
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
+            await cleanupOldPanels(verifyChannel, 'Welkom bij Zoet Family');
+
+            const verifyCount = countRoleMembers(verifyChannel.guild, CONFIG.VERIFY_ROLE_ID);
+
             const embed = new EmbedBuilder()
                 .setTitle('Zoet Family Verification')
                 .setDescription('Welkom bij Zoet Family!\n\nKlik op de knop hieronder om jezelf te verifiëren en toegang te krijgen tot de server.')
@@ -78,7 +123,7 @@ client.once('ready', async () => {
 
             const button = new ButtonBuilder()
                 .setCustomId(CONFIG.VERIFY_BUTTON_ID)
-                .setLabel('Verify')
+                .setLabel(`✅ Verified — ${verifyCount}`)
                 .setStyle(ButtonStyle.Success);
 
             const row = new ActionRowBuilder().addComponents(button);
@@ -89,10 +134,14 @@ client.once('ready', async () => {
         console.error('Fout bij verify panel:', err);
     }
 
-    // Snapchat ping panel sturen
+    // Snapchat ping panel
     try {
         const snapChannel = await client.channels.fetch(CONFIG.SNAP_CHANNEL_ID);
         if (snapChannel) {
+            await cleanupOldPanels(snapChannel, 'Snapchat Ping');
+
+            const snapCount = countRoleMembers(snapChannel.guild, CONFIG.SNAP_ROLE_ID);
+
             const embed = new EmbedBuilder()
                 .setTitle('Snapchat Ping')
                 .setDescription(
@@ -104,7 +153,7 @@ client.once('ready', async () => {
 
             const button = new ButtonBuilder()
                 .setCustomId(CONFIG.SNAP_BUTTON_ID)
-                .setLabel('Snapchat Ping')
+                .setLabel(`👻 Snapchat Ping — ${snapCount}`)
                 .setStyle(ButtonStyle.Primary);
 
             const row = new ActionRowBuilder().addComponents(button);
@@ -116,8 +165,10 @@ client.once('ready', async () => {
     }
 });
 
-// --- WELCOME ---
+// Status updaten als iemand joint of leaved
 client.on('guildMemberAdd', async (member) => {
+    updateStatus(member.guild);
+
     try {
         const channel = member.guild.channels.cache.get(CONFIG.WELCOME_CHANNEL_ID);
         if (!channel) return;
@@ -141,16 +192,13 @@ client.on('guildMemberAdd', async (member) => {
     }
 });
 
-function getOrdinal(n) {
-    const s = ['th', 'st', 'nd', 'rd'];
-    const v = n % 100;
-    return s[(v - 20) % 10] || s[v] || s[0];
-}
+client.on('guildMemberRemove', (member) => {
+    updateStatus(member.guild);
+});
 
 // --- INTERACTIONS ---
 client.on('interactionCreate', async (interaction) => {
 
-    // Slash commands
     if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'clear') {
             const amount = interaction.options.getInteger('amount');
@@ -170,7 +218,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
-    // Buttons
     if (!interaction.isButton()) return;
 
     // Verify knop
@@ -186,6 +233,17 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             await interaction.member.roles.add(role);
+
+            // Update knop met nieuw aantal
+            const newCount = countRoleMembers(interaction.guild, CONFIG.VERIFY_ROLE_ID);
+            const newRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(CONFIG.VERIFY_BUTTON_ID)
+                    .setLabel(`✅ Verified — ${newCount}`)
+                    .setStyle(ButtonStyle.Success)
+            );
+            await interaction.message.edit({ components: [newRow] }).catch(() => {});
+
             await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Zoet Family.', ephemeral: true });
         } catch (err) {
             console.error('Fout bij verify:', err);
@@ -209,6 +267,16 @@ client.on('interactionCreate', async (interaction) => {
             }
 
             await interaction.member.roles.add(role);
+
+            const newCount = countRoleMembers(interaction.guild, CONFIG.SNAP_ROLE_ID);
+            const newRow = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(CONFIG.SNAP_BUTTON_ID)
+                    .setLabel(`👻 Snapchat Ping — ${newCount}`)
+                    .setStyle(ButtonStyle.Primary)
+            );
+            await interaction.message.edit({ components: [newRow] }).catch(() => {});
+
             await interaction.reply({ content: 'Je hebt de Snapchat Ping rol gekregen. Je krijgt nu een ping als er snaps gedropped worden.', ephemeral: true });
         } catch (err) {
             console.error('Fout bij snapchat ping:', err);
