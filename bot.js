@@ -200,7 +200,7 @@ function buildHoneypotEmbed() {
         .setDescription(
             '⚡ **Actie:** KICK\n\n' +
             '**PLAATS HIER NIETS** - Elk bericht, elke afbeelding, bijlage of sticker die hier geplaatst wordt, zorgt ervoor dat je **direct** gekickt wordt. Geen uitzonderingen!\n\n' +
-            `**Totaal kicks:** ${kickData.total}\n\n` +
+            `**Totaal aantal kicks:** ${kickData.total}\n\n` +
             '🛡️ **Dit kanaal wordt 24/7 automatisch gecontroleerd**'
         )
         .setColor('#f7c948')
@@ -536,7 +536,6 @@ client.on('messageCreate', async (message) => {
         kickData.total += 1;
         saveJson(KICK_FILE, kickData);
 
-        // Waarschuwingsembed bijwerken met het nieuwe totaal
         await refreshHoneypotEmbed(message.channel);
 
         const embed = new EmbedBuilder()
@@ -544,7 +543,7 @@ client.on('messageCreate', async (message) => {
             .setDescription(
                 `**Gebruiker:** ${message.author.tag} (\`${message.author.id}\`)\n` +
                 `**Actie:** KICK\n` +
-                `**Totaal kicks:** ${kickData.total}`
+                `**Totaal aantal kicks:** ${kickData.total}`
             )
             .setColor('#e74c3c')
             .setTimestamp();
