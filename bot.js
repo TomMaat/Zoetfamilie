@@ -19,7 +19,7 @@ const {
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Zoet Family bot is online');
+    res.end('Familie Zoet bot is online');
 }).listen(PORT, () => {
     console.log(`HTTP server luistert op poort ${PORT}`);
 });
@@ -27,7 +27,7 @@ http.createServer((req, res) => {
 // --- INSTELLINGEN ---
 const CONFIG = {
     TOKEN: process.env.DISCORD_TOKEN,
-    SERVER_NAME: 'Zoet Family',
+    SERVER_NAME: 'Familie Zoet',
     LOGO_URL: 'https://cdn.discordapp.com/attachments/1559589352185528421/1567249653492351066/Zoet.png?ex=6aeb7e7b&is=6aea2cfb&hm=7f4e899aec06642e8509c44999dd0368c84e56983cc0bbc1b0cc69f57470b62d&',
 
     WELCOME_CHANNEL_ID: '1567280566041190410',
@@ -150,7 +150,6 @@ async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
     }
 }
 
-// Stuurt een log naar het log kanaal
 async function sendLog(guild, { title, description, color, thumbnail }) {
     try {
         const channel = guild.channels.cache.get(CONFIG.LOG_CHANNEL_ID);
@@ -208,13 +207,13 @@ client.once('clientReady', async () => {
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
-            await cleanupOldPanels(verifyChannel, 'Welkom bij Zoet Family');
+            await cleanupOldPanels(verifyChannel, 'Welkom bij Familie Zoet');
 
             const verifyCount = await countRoleMembers(verifyChannel.guild, CONFIG.VERIFY_ROLE_ID);
 
             const embed = new EmbedBuilder()
-                .setTitle('Zoet Family Verification')
-                .setDescription('Welkom bij Zoet Family!\n\nKlik op de knop hieronder om jezelf te verifiëren en toegang te krijgen tot de server.')
+                .setTitle('Familie Zoet Verification')
+                .setDescription('Welkom bij Familie Zoet!\n\nKlik op de knop hieronder om jezelf te verifiëren en toegang te krijgen tot de server.')
                 .setColor('#2b2d31')
                 .setThumbnail(CONFIG.LOGO_URL);
 
@@ -301,7 +300,7 @@ client.on('guildMemberAdd', async (member) => {
         const embed = new EmbedBuilder()
             .setDescription(
                 `Welkom ${member}!\n` +
-                `Je bent lid **${memberCount}e** van **${CONFIG.SERVER_NAME}**.`
+                `Je bent lid **${memberCount}** van **${CONFIG.SERVER_NAME}**.`
             )
             .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
             .setColor('#2b2d31')
@@ -472,7 +471,7 @@ client.on('interactionCreate', async (interaction) => {
             );
             await interaction.message.edit({ components: [newRow] }).catch(() => {});
 
-            await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Zoet Family.', flags: MessageFlags.Ephemeral });
+            await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Familie Zoet.', flags: MessageFlags.Ephemeral });
         } catch (err) {
             console.error('Fout bij verify:', err);
             if (!interaction.replied) {
