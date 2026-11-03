@@ -1,7 +1,7 @@
 {
   "name": "zoet-family-bot",
   "version": "1.0.0",
-  "description": "Zoet Family",
+  "description": "Familie Zoet",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
