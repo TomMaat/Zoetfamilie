@@ -40,7 +40,9 @@ const CONFIG = {
     SNAP_ROLE_ID: '1559951158951419954',
     SNAP_BUTTON_ID: 'snap_ping_click',
 
-    HONEYPOT_CHANNEL_ID: '1567295355740229733'
+    HONEYPOT_CHANNEL_ID: '1567295355740229733',
+
+    LOG_CHANNEL_ID: '1567299300436746310'
 };
 
 const KICK_FILE = path.join(__dirname, 'kicks.json');
@@ -122,7 +124,6 @@ function updateStatus(guild) {
     client.user.setActivity(`${guild.memberCount} leden`, { type: ActivityType.Watching });
 }
 
-// Zoekt het panel-bericht in een kanaal en update de knop met het huidige aantal
 async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
     try {
         const channel = await client.channels.fetch(channelId);
@@ -146,6 +147,27 @@ async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
         await panel.edit({ components: [row] }).catch(() => {});
     } catch (err) {
         console.error('Fout bij refresh panel:', err);
+    }
+}
+
+// Stuurt een log naar het log kanaal
+async function sendLog(guild, { title, description, color, thumbnail }) {
+    try {
+        const channel = guild.channels.cache.get(CONFIG.LOG_CHANNEL_ID);
+        if (!channel) return;
+
+        const embed = new EmbedBuilder()
+            .setTitle(title)
+            .setDescription(description)
+            .setColor(color)
+            .setTimestamp();
+
+        if (thumbnail) embed.setThumbnail(thumbnail);
+        else embed.setThumbnail(CONFIG.LOGO_URL);
+
+        await channel.send({ embeds: [embed] }).catch(() => {});
+    } catch (err) {
+        console.error('Fout bij sturen log:', err);
     }
 }
 
@@ -294,28 +316,73 @@ client.on('guildMemberAdd', async (member) => {
 client.on('guildMemberRemove', async (member) => {
     updateStatus(member.guild);
 
-    // Als het lid een van de rollen had, teller omlaag
     const hadVerify = member.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
     const hadSnap = member.roles.cache.has(CONFIG.SNAP_ROLE_ID);
 
     if (hadVerify) {
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
+        await sendLog(member.guild, {
+            title: '❌ Verify verlaten',
+            description: `${member.user.tag} (\`${member.id}\`) heeft de server verlaten en had de verify rol.`,
+            color: '#e74c3c',
+            thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
+        });
     }
+
     if (hadSnap) {
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
+        await sendLog(member.guild, {
+            title: '❌ Snapchat Ping verlaten',
+            description: `${member.user.tag} (\`${member.id}\`) heeft de server verlaten en had de Snapchat Ping rol.`,
+            color: '#e74c3c',
+            thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
+        });
     }
 });
 
-// Rol eraf -> teller omlaag
+// --- ROLLEN: ADD / REMOVE LOGS ---
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
-    const lostVerify = oldMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID) && !newMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
-    const lostSnap = oldMember.roles.cache.has(CONFIG.SNAP_ROLE_ID) && !newMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
+    const oldVerify = oldMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
+    const newVerify = newMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
+    const oldSnap = oldMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
+    const newSnap = newMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
 
-    if (lostVerify) {
+    // Verify
+    if (!oldVerify && newVerify) {
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
+        await sendLog(newMember.guild, {
+            title: '✅ Verify gekregen',
+            description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de verify rol gekregen.`,
+            color: '#2ecc71',
+            thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
+        });
+    } else if (oldVerify && !newVerify) {
+        await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
+        await sendLog(newMember.guild, {
+            title: '❌ Verify verwijderd',
+            description: `${newMember.user.tag} (\`${newMember.id}\`) is niet meer geverifieerd.`,
+            color: '#e74c3c',
+            thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
+        });
     }
-    if (lostSnap) {
+
+    // Snapchat
+    if (!oldSnap && newSnap) {
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
+        await sendLog(newMember.guild, {
+            title: '👻 Snapchat Ping gekregen',
+            description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de Snapchat Ping rol gekregen.`,
+            color: '#f7c948',
+            thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
+        });
+    } else if (oldSnap && !newSnap) {
+        await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
+        await sendLog(newMember.guild, {
+            title: '❌ Snapchat Ping verwijderd',
+            description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de Snapchat Ping rol niet meer.`,
+            color: '#e74c3c',
+            thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
+        });
     }
 });
 
