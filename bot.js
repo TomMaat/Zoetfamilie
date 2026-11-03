@@ -81,7 +81,6 @@ function saveJson(file, data) {
 
 let kickData = loadJson(KICK_FILE, { total: 0 });
 
-// Anti-nuke standaard AAN. Alleen als het bestand expliciet false bevat, blijft het uit.
 let antinukeData = loadJson(ANTINUKE_FILE, { enabled: true });
 if (typeof antinukeData.enabled !== 'boolean') antinukeData.enabled = true;
 saveJson(ANTINUKE_FILE, antinukeData);
@@ -194,6 +193,37 @@ async function sendLog(guild, { title, description, color, thumbnail }) {
     }
 }
 
+// Bouwt de honeypot waarschuwingsembed met het actuele kick-totaal
+function buildHoneypotEmbed() {
+    return new EmbedBuilder()
+        .setTitle('🍯 Dit is een honeypot kanaal!')
+        .setDescription(
+            '⚡ **Actie:** KICK\n\n' +
+            '**PLAATS HIER NIETS** - Elk bericht, elke afbeelding, bijlage of sticker die hier geplaatst wordt, zorgt ervoor dat je **direct** gekickt wordt. Geen uitzonderingen!\n\n' +
+            `**Totaal kicks:** ${kickData.total}\n\n` +
+            '🛡️ **Dit kanaal wordt 24/7 automatisch gecontroleerd**'
+        )
+        .setColor('#f7c948')
+        .setThumbnail(CONFIG.LOGO_URL);
+}
+
+// Zoekt de honeypot-waarschuwing en werkt het kick-totaal bij
+async function refreshHoneypotEmbed(channel) {
+    try {
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const panel = messages.find(m =>
+            m.author.id === client.user.id &&
+            m.embeds.length > 0 &&
+            m.embeds[0].description &&
+            m.embeds[0].description.includes('honeypot kanaal')
+        );
+        if (!panel) return;
+        await panel.edit({ embeds: [buildHoneypotEmbed()] }).catch(() => {});
+    } catch (err) {
+        console.error('Fout bij updaten honeypot embed:', err);
+    }
+}
+
 // --- ANTI-NUKE ---
 function checkThreshold(userId, type) {
     const key = `${userId}:${type}`;
@@ -280,10 +310,6 @@ client.once('clientReady', async () => {
                 )
                 .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
             new SlashCommandBuilder()
-                .setName('kicks')
-                .setDescription('Bekijk het totaal aantal honeypot kicks')
-                .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers),
-            new SlashCommandBuilder()
                 .setName('antinuke')
                 .setDescription('Zet het anti-nuke systeem aan of uit')
                 .addStringOption(opt =>
@@ -366,17 +392,7 @@ client.once('clientReady', async () => {
             await clearChannel(honeyChannel);
             console.log('Honeypot kanaal leeggemaakt');
 
-            const embed = new EmbedBuilder()
-                .setTitle('🍯 Dit is een honeypot kanaal!')
-                .setDescription(
-                    '⚡ **Actie:** KICK\n\n' +
-                    '**PLAATS HIER NIETS** - Elk bericht, elke afbeelding, bijlage of sticker die hier geplaatst wordt, zorgt ervoor dat je **direct** gekickt wordt. Geen uitzonderingen!\n\n' +
-                    '🛡️ **Dit kanaal wordt 24/7 automatisch gecontroleerd**'
-                )
-                .setColor('#f7c948')
-                .setThumbnail(CONFIG.LOGO_URL);
-
-            await honeyChannel.send({ embeds: [embed] });
+            await honeyChannel.send({ embeds: [buildHoneypotEmbed()] });
             console.log('Honeypot waarschuwing gestuurd');
         }
     } catch (err) {
@@ -520,6 +536,9 @@ client.on('messageCreate', async (message) => {
         kickData.total += 1;
         saveJson(KICK_FILE, kickData);
 
+        // Waarschuwingsembed bijwerken met het nieuwe totaal
+        await refreshHoneypotEmbed(message.channel);
+
         const embed = new EmbedBuilder()
             .setTitle('🍯 Honeypot geactiveerd')
             .setDescription(
@@ -554,13 +573,6 @@ client.on('interactionCreate', async (interaction) => {
                 console.error('Fout bij clear:', err);
                 await interaction.reply({ content: 'Kon de berichten niet verwijderen. Berichten ouder dan 14 dagen kunnen niet verwijderd worden.', flags: MessageFlags.Ephemeral });
             }
-        }
-
-        if (interaction.commandName === 'kicks') {
-            return interaction.reply({
-                content: `Totaal aantal honeypot kicks: **${kickData.total}**`,
-                flags: MessageFlags.Ephemeral
-            });
         }
 
         if (interaction.commandName === 'antinuke') {
