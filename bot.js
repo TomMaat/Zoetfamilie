@@ -64,12 +64,32 @@ client.on('guildMemberAdd', async (member) => {
         const channel = member.guild.channels.cache.get(CONFIG.WELCOME_CHANNEL_ID);
         if (!channel) return;
 
-        const welcomeMessage = `Welcome to Zoet Family, ${member}! Please head over to <#${CONFIG.VERIFY_CHANNEL_ID}> to verify yourself and get access.`;
-        await channel.send(welcomeMessage);
+        // Member count (including the new member)
+        const memberCount = member.guild.memberCount;
+
+        const embed = new EmbedBuilder()
+            .setTitle(`Welcome to ${CONFIG.SERVER_NAME}!`)
+            .setDescription(
+                `Hey ${member}, welcome to **${CONFIG.SERVER_NAME}**!\n\n` +
+                `You are the **${memberCount}${getOrdinal(memberCount)}** member to join.\n\n` +
+                `Please head over to <#${CONFIG.VERIFY_CHANNEL_ID}> to verify yourself and get access.`
+            )
+            .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 256 }))
+            .setColor('#2b2d31')
+            .setFooter({ text: CONFIG.SERVER_NAME });
+
+        await channel.send({ embeds: [embed] });
     } catch (error) {
         console.error('Error sending welcome message:', error);
     }
 });
+
+// Helper for "1st", "2nd", "3rd", "4th"...
+function getOrdinal(n) {
+    const s = ['th', 'st', 'nd', 'rd'];
+    const v = n % 100;
+    return s[(v - 20) % 10] || s[v] || s[0];
+}
 
 // --- BUTTON INTERACTION ---
 client.on('interactionCreate', async (interaction) => {
