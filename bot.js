@@ -1,3 +1,4 @@
+const http = require('http');
 const {
     Client,
     GatewayIntentBits,
@@ -8,8 +9,18 @@ const {
     EmbedBuilder,
     PermissionFlagsBits,
     SlashCommandBuilder,
-    ActivityType
+    ActivityType,
+    MessageFlags
 } = require('discord.js');
+
+// --- KLEINE HTTP SERVER ZODAT RENDER EEN POORT ZIET ---
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('Zoet Family bot is online');
+}).listen(PORT, () => {
+    console.log(`HTTP server luistert op poort ${PORT}`);
+});
 
 // --- INSTELLINGEN ---
 const CONFIG = {
@@ -17,15 +28,12 @@ const CONFIG = {
     SERVER_NAME: 'Zoet Family',
     LOGO_URL: 'https://cdn.discordapp.com/attachments/1559589352185528421/1567249653492351066/Zoet.png?ex=6aeb7e7b&is=6aea2cfb&hm=7f4e899aec06642e8509c44999dd0368c84e56983cc0bbc1b0cc69f57470b62d&',
 
-    // Welcome
     WELCOME_CHANNEL_ID: '1567280566041190410',
 
-    // Verify
     VERIFY_CHANNEL_ID: '1567280670915436705',
     VERIFY_ROLE_ID: '1554510750092099690',
     VERIFY_BUTTON_ID: 'verify_click',
 
-    // Snapchat ping
     SNAP_CHANNEL_ID: '1567284467347751042',
     SNAP_ROLE_ID: '1559951158951419954',
     SNAP_BUTTON_ID: 'snap_ping_click'
@@ -48,7 +56,13 @@ function getOrdinal(n) {
     return s[(v - 20) % 10] || s[v] || s[0];
 }
 
-function countRoleMembers(guild, roleId) {
+// Zorgt dat alle members in de cache zitten, dan tellen
+async function countRoleMembers(guild, roleId) {
+    try {
+        await guild.members.fetch();
+    } catch (err) {
+        console.error('Fout bij members fetch:', err);
+    }
     const role = guild.roles.cache.get(roleId);
     if (!role) return 0;
     return role.members.size;
@@ -71,21 +85,19 @@ async function cleanupOldPanels(channel, markerText) {
     }
 }
 
-// Update bot status met aantal leden
 function updateStatus(guild) {
     if (!guild) return;
     client.user.setActivity(`${guild.memberCount} leden`, { type: ActivityType.Watching });
 }
 
 // --- BOT ONLINE ---
-client.once('ready', async () => {
+client.once('clientReady', async () => {
     console.log(`Ingelogd als ${client.user.tag}`);
 
-    // Status zetten
     const guild = client.guilds.cache.first();
     if (guild) updateStatus(guild);
 
-    // Slash commands registreren
+    // Slash commands
     try {
         const commands = [
             new SlashCommandBuilder()
@@ -113,7 +125,7 @@ client.once('ready', async () => {
         if (verifyChannel) {
             await cleanupOldPanels(verifyChannel, 'Welkom bij Zoet Family');
 
-            const verifyCount = countRoleMembers(verifyChannel.guild, CONFIG.VERIFY_ROLE_ID);
+            const verifyCount = await countRoleMembers(verifyChannel.guild, CONFIG.VERIFY_ROLE_ID);
 
             const embed = new EmbedBuilder()
                 .setTitle('Zoet Family Verification')
@@ -128,19 +140,19 @@ client.once('ready', async () => {
 
             const row = new ActionRowBuilder().addComponents(button);
             await verifyChannel.send({ embeds: [embed], components: [row] });
-            console.log('Verify panel gestuurd');
+            console.log(`Verify panel gestuurd (${verifyCount} geverifieerd)`);
         }
     } catch (err) {
         console.error('Fout bij verify panel:', err);
     }
 
-    // Snapchat ping panel
+    // Snapchat panel
     try {
         const snapChannel = await client.channels.fetch(CONFIG.SNAP_CHANNEL_ID);
         if (snapChannel) {
             await cleanupOldPanels(snapChannel, 'Snapchat Ping');
 
-            const snapCount = countRoleMembers(snapChannel.guild, CONFIG.SNAP_ROLE_ID);
+            const snapCount = await countRoleMembers(snapChannel.guild, CONFIG.SNAP_ROLE_ID);
 
             const embed = new EmbedBuilder()
                 .setTitle('Snapchat Ping')
@@ -158,14 +170,14 @@ client.once('ready', async () => {
 
             const row = new ActionRowBuilder().addComponents(button);
             await snapChannel.send({ embeds: [embed], components: [row] });
-            console.log('Snapchat ping panel gestuurd');
+            console.log(`Snapchat panel gestuurd (${snapCount} met rol)`);
         }
     } catch (err) {
         console.error('Fout bij snapchat panel:', err);
     }
 });
 
-// Status updaten als iemand joint of leaved
+// --- WELCOME ---
 client.on('guildMemberAdd', async (member) => {
     updateStatus(member.guild);
 
@@ -204,15 +216,15 @@ client.on('interactionCreate', async (interaction) => {
             const amount = interaction.options.getInteger('amount');
 
             if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om dit te doen.', ephemeral: true });
+                return interaction.reply({ content: 'Je hebt geen toestemming om dit te doen.', flags: MessageFlags.Ephemeral });
             }
 
             try {
                 await interaction.channel.bulkDelete(amount, true);
-                await interaction.reply({ content: `${amount} berichten verwijderd.`, ephemeral: true });
+                await interaction.reply({ content: `${amount} berichten verwijderd.`, flags: MessageFlags.Ephemeral });
             } catch (err) {
                 console.error('Fout bij clear:', err);
-                await interaction.reply({ content: 'Kon de berichten niet verwijderen. Berichten ouder dan 14 dagen kunnen niet verwijderd worden.', ephemeral: true });
+                await interaction.reply({ content: 'Kon de berichten niet verwijderen. Berichten ouder dan 14 dagen kunnen niet verwijderd worden.', flags: MessageFlags.Ephemeral });
             }
         }
         return;
@@ -225,17 +237,16 @@ client.on('interactionCreate', async (interaction) => {
         try {
             const role = interaction.guild.roles.cache.get(CONFIG.VERIFY_ROLE_ID);
             if (!role) {
-                return interaction.reply({ content: 'De verify rol is niet gevonden. Neem contact op met een admin.', ephemeral: true });
+                return interaction.reply({ content: 'De verify rol is niet gevonden. Neem contact op met een admin.', flags: MessageFlags.Ephemeral });
             }
 
             if (interaction.member.roles.cache.has(CONFIG.VERIFY_ROLE_ID)) {
-                return interaction.reply({ content: 'Je bent al geverifieerd!', ephemeral: true });
+                return interaction.reply({ content: 'Je bent al geverifieerd!', flags: MessageFlags.Ephemeral });
             }
 
             await interaction.member.roles.add(role);
 
-            // Update knop met nieuw aantal
-            const newCount = countRoleMembers(interaction.guild, CONFIG.VERIFY_ROLE_ID);
+            const newCount = await countRoleMembers(interaction.guild, CONFIG.VERIFY_ROLE_ID);
             const newRow = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId(CONFIG.VERIFY_BUTTON_ID)
@@ -244,31 +255,31 @@ client.on('interactionCreate', async (interaction) => {
             );
             await interaction.message.edit({ components: [newRow] }).catch(() => {});
 
-            await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Zoet Family.', ephemeral: true });
+            await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Zoet Family.', flags: MessageFlags.Ephemeral });
         } catch (err) {
             console.error('Fout bij verify:', err);
             if (!interaction.replied) {
-                await interaction.reply({ content: 'Er ging iets mis. Probeer het later opnieuw.', ephemeral: true });
+                await interaction.reply({ content: 'Er ging iets mis. Probeer het later opnieuw.', flags: MessageFlags.Ephemeral }).catch(() => {});
             }
         }
         return;
     }
 
-    // Snapchat ping knop
+    // Snapchat knop
     if (interaction.customId === CONFIG.SNAP_BUTTON_ID) {
         try {
             const role = interaction.guild.roles.cache.get(CONFIG.SNAP_ROLE_ID);
             if (!role) {
-                return interaction.reply({ content: 'De Snapchat Ping rol is niet gevonden. Neem contact op met een admin.', ephemeral: true });
+                return interaction.reply({ content: 'De Snapchat Ping rol is niet gevonden. Neem contact op met een admin.', flags: MessageFlags.Ephemeral });
             }
 
             if (interaction.member.roles.cache.has(CONFIG.SNAP_ROLE_ID)) {
-                return interaction.reply({ content: 'Je hebt de Snapchat Ping rol al!', ephemeral: true });
+                return interaction.reply({ content: 'Je hebt de Snapchat Ping rol al!', flags: MessageFlags.Ephemeral });
             }
 
             await interaction.member.roles.add(role);
 
-            const newCount = countRoleMembers(interaction.guild, CONFIG.SNAP_ROLE_ID);
+            const newCount = await countRoleMembers(interaction.guild, CONFIG.SNAP_ROLE_ID);
             const newRow = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId(CONFIG.SNAP_BUTTON_ID)
@@ -277,14 +288,18 @@ client.on('interactionCreate', async (interaction) => {
             );
             await interaction.message.edit({ components: [newRow] }).catch(() => {});
 
-            await interaction.reply({ content: 'Je hebt de Snapchat Ping rol gekregen. Je krijgt nu een ping als er snaps gedropped worden.', ephemeral: true });
+            await interaction.reply({ content: 'Je hebt de Snapchat Ping rol gekregen. Je krijgt nu een ping als er snaps gedropped worden.', flags: MessageFlags.Ephemeral });
         } catch (err) {
             console.error('Fout bij snapchat ping:', err);
             if (!interaction.replied) {
-                await interaction.reply({ content: 'Er ging iets mis. Probeer het later opnieuw.', ephemeral: true });
+                await interaction.reply({ content: 'Er ging iets mis. Probeer het later opnieuw.', flags: MessageFlags.Ephemeral }).catch(() => {});
             }
         }
     }
+});
+
+client.on('error', (err) => {
+    console.error('Client error:', err);
 });
 
 // --- LOGIN ---
