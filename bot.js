@@ -13,7 +13,11 @@ const {
     SlashCommandBuilder,
     ActivityType,
     MessageFlags,
-    AuditLogEvent
+    AuditLogEvent,
+    ChannelType,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle
 } = require('discord.js');
 
 // --- KLEINE HTTP SERVER ZODAT RENDER EEN POORT ZIET ---
@@ -44,6 +48,9 @@ const CONFIG = {
     HONEYPOT_CHANNEL_ID: '1567295355740229733',
 
     LOG_CHANNEL_ID: '1567299300436746310',
+
+    CALL_CHANNEL_ID: '1567542253633933402',
+    CALL_CATEGORY_ID: '1567297941146829040',
 
     ANTINUKE_ALLOWED_USERS: [
         '1033753872927293520',
@@ -87,16 +94,37 @@ saveJson(ANTINUKE_FILE, antinukeData);
 
 const actionTracker = new Map();
 
+// Actieve calls: channelId -> { ownerId, isPrivate, guildId }
+const activeCalls = new Map();
+// Toegelaten users per call: channelId -> Set<userId>
+const callAllowed = new Map();
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMembers,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildModeration
+        GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildVoiceStates
     ],
     partials: [Partials.Channel, Partials.Message]
 });
+
+// --- FONT HELPER ---
+const FONT_MAP = {
+    a: '𝐚', b: '𝐛', c: '𝐜', d: '𝐝', e: '𝐞', f: '𝐟', g: '𝐠', h: '𝐡', i: '𝐢', j: '𝐣',
+    k: '𝐤', l: '𝐥', m: '𝐦', n: '𝐧', o: '𝐨', p: '𝐩', q: '𝐪', r: '𝐫', s: '𝐬', t: '𝐭',
+    u: '𝐮', v: '𝐯', w: '𝐰', x: '𝐱', y: '𝐲', z: '𝐳',
+    A: '𝐀', B: '𝐁', C: '𝐂', D: '𝐃', E: '𝐄', F: '𝐅', G: '𝐆', H: '𝐇', I: '𝐈', J: '𝐉',
+    K: '𝐊', L: '𝐋', M: '𝐌', N: '𝐍', O: '𝐎', P: '𝐏', Q: '𝐐', R: '𝐑', S: '𝐒', T: '𝐓',
+    U: '𝐔', V: '𝐕', W: '𝐖', X: '𝐗', Y: '𝐘', Z: '𝐙',
+    0: '𝟎', 1: '𝟏', 2: '𝟐', 3: '𝟑', 4: '𝟒', 5: '𝟓', 6: '𝟔', 7: '𝟕', 8: '𝟖', 9: '𝟗'
+};
+
+function toFont(text) {
+    return text.split('').map(ch => FONT_MAP[ch] || ch).join('');
+}
 
 // --- HELPERS ---
 async function countRoleMembers(guild, roleId) {
@@ -193,6 +221,31 @@ async function sendLog(guild, { title, description, color, thumbnail }) {
     }
 }
 
+// Zet de categorie-rechten goed zodat niet-geverifieerden geen calls zien
+async function setupCallCategory(guild) {
+    try {
+        const category = guild.channels.cache.get(CONFIG.CALL_CATEGORY_ID);
+        if (!category) {
+            console.log('Call categorie niet gevonden');
+            return;
+        }
+
+        await category.permissionOverwrites.set([
+            {
+                id: guild.roles.everyone.id,
+                deny: [PermissionFlagsBits.ViewChannel]
+            },
+            {
+                id: CONFIG.VERIFY_ROLE_ID,
+                allow: [PermissionFlagsBits.ViewChannel]
+            }
+        ]);
+        console.log('Call categorie rechten ingesteld');
+    } catch (err) {
+        console.error('Fout bij instellen call categorie:', err);
+    }
+}
+
 // Bouwt de honeypot waarschuwingsembed met het actuele kick-totaal
 function buildHoneypotEmbed() {
     return new EmbedBuilder()
@@ -207,7 +260,6 @@ function buildHoneypotEmbed() {
         .setThumbnail(CONFIG.LOGO_URL);
 }
 
-// Zoekt de honeypot-waarschuwing en werkt het kick-totaal bij
 async function refreshHoneypotEmbed(channel) {
     try {
         const messages = await channel.messages.fetch({ limit: 50 });
@@ -288,13 +340,165 @@ async function handleNukeAction(guild, type, targetId) {
     }
 }
 
+// --- CALL PANEL ---
+function buildCallPanel() {
+    const embed = new EmbedBuilder()
+        .setTitle('🔊 Calls')
+        .setDescription(
+            'Maak een call aan met de knop hieronder.\n\n' +
+            '**Openbaar** — iedereen met verify kan joinen.\n' +
+            '**Privé** — alleen jij kan mensen toelaten.'
+        )
+        .setColor('#5865f2')
+        .setThumbnail(CONFIG.LOGO_URL);
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('call_open_public')
+            .setLabel('Openbaar')
+            .setEmoji('🔊')
+            .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+            .setCustomId('call_open_private')
+            .setLabel('Privé')
+            .setEmoji('🔒')
+            .setStyle(ButtonStyle.Danger)
+    );
+
+    return { embeds: [embed], components: [row] };
+}
+
+async function handleCallPanelButton(interaction) {
+    const isPrivate = interaction.customId === 'call_open_private';
+
+    const modal = new ModalBuilder()
+        .setCustomId(isPrivate ? 'call_modal_private' : 'call_modal_public')
+        .setTitle(isPrivate ? 'Privé call maken' : 'Openbare call maken');
+
+    const input = new TextInputBuilder()
+        .setCustomId('call_name')
+        .setLabel('Naam van de call')
+        .setStyle(TextInputStyle.Short)
+        .setMaxLength(50)
+        .setMinLength(1)
+        .setRequired(true)
+        .setPlaceholder('bijv. chillen');
+
+    modal.addComponents(new ActionRowBuilder().addComponents(input));
+    await interaction.showModal(modal);
+}
+
+// Maakt het call-kanaal aan en stuurt het info-bericht
+async function createCall(interaction, name, isPrivate) {
+    const guild = interaction.guild;
+    const member = interaction.member;
+    const verifyRole = guild.roles.cache.get(CONFIG.VERIFY_ROLE_ID);
+
+    const prefix = isPrivate ? '🔒︱' : '🔊︱';
+    const channelName = `${prefix}${toFont(name)}`;
+
+    // Rechten
+    const overwrites = [
+        {
+            id: guild.roles.everyone.id,
+            deny: [PermissionFlagsBits.ViewChannel]
+        },
+        {
+            id: CONFIG.VERIFY_ROLE_ID,
+            allow: [PermissionFlagsBits.ViewChannel],
+            deny: isPrivate ? [PermissionFlagsBits.Connect] : []
+        },
+        {
+            id: member.id,
+            allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.Connect,
+                PermissionFlagsBits.ManageChannels,
+                PermissionFlagsBits.MoveMembers
+            ]
+        },
+        {
+            id: client.user.id,
+            allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.Connect,
+                PermissionFlagsBits.ManageChannels,
+                PermissionFlagsBits.MoveMembers
+            ]
+        }
+    ];
+
+    const channel = await guild.channels.create({
+        name: channelName,
+        type: ChannelType.GuildVoice,
+        parent: CONFIG.CALL_CATEGORY_ID,
+        permissionOverwrites: overwrites,
+        reason: `Call van ${member.user.tag}`
+    });
+
+    activeCalls.set(channel.id, {
+        ownerId: member.id,
+        isPrivate,
+        guildId: guild.id
+    });
+    callAllowed.set(channel.id, new Set([member.id]));
+
+    // Info-embed in het call-kanaal
+    const embed = new EmbedBuilder()
+        .setTitle(isPrivate ? '🔒 Privé call' : '🔊 Openbare call')
+        .setDescription(
+            `**Eigenaar:** ${member}\n` +
+            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n\n` +
+            (isPrivate
+                ? 'Deze call is privé. Alleen de eigenaar kan mensen toelaten via de knop hieronder.'
+                : 'Deze call is openbaar. Iedereen met verify kan joinen.')
+        )
+        .setColor(isPrivate ? '#e74c3c' : '#2ecc71')
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
+
+    const components = [];
+    if (isPrivate) {
+        components.push(
+            new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`call_allow_${channel.id}`)
+                    .setLabel('Iemand toelaten')
+                    .setEmoji('✅')
+                    .setStyle(ButtonStyle.Success)
+            )
+        );
+    }
+
+    await channel.send({
+        content: `<@${member.id}>`,
+        embeds: [embed],
+        components
+    }).catch(() => {});
+
+    await interaction.reply({
+        content: `Je call is aangemaakt: <#${channel.id}>`,
+        flags: MessageFlags.Ephemeral
+    });
+
+    // Log
+    await sendLog(guild, {
+        title: isPrivate ? '🔒 Privé call gemaakt' : '🔊 Openbare call gemaakt',
+        description: `**Eigenaar:** ${member.user.tag} (\`${member.id}\`)\n**Kanaal:** <#${channel.id}>`,
+        color: isPrivate ? '#e74c3c' : '#2ecc71',
+        thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
+    });
+}
+
 // --- BOT ONLINE ---
 client.once('clientReady', async () => {
     console.log(`Ingelogd als ${client.user.tag}`);
     console.log(`Anti-nuke: ${antinukeData.enabled ? 'AAN' : 'UIT'}`);
 
     const guild = client.guilds.cache.first();
-    if (guild) updateStatus(guild);
+    if (guild) {
+        updateStatus(guild);
+        await setupCallCategory(guild);
+    }
 
     try {
         const commands = [
@@ -329,6 +533,7 @@ client.once('clientReady', async () => {
         console.error('Fout bij registreren commands:', err);
     }
 
+    // Verify panel
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
@@ -356,6 +561,7 @@ client.once('clientReady', async () => {
         console.error('Fout bij verify panel:', err);
     }
 
+    // Snapchat panel
     try {
         const snapChannel = await client.channels.fetch(CONFIG.SNAP_CHANNEL_ID);
         if (snapChannel) {
@@ -386,6 +592,7 @@ client.once('clientReady', async () => {
         console.error('Fout bij snapchat panel:', err);
     }
 
+    // Honeypot
     try {
         const honeyChannel = await client.channels.fetch(CONFIG.HONEYPOT_CHANNEL_ID);
         if (honeyChannel) {
@@ -397,6 +604,18 @@ client.once('clientReady', async () => {
         }
     } catch (err) {
         console.error('Fout bij honeypot panel:', err);
+    }
+
+    // Call panel
+    try {
+        const callChannel = await client.channels.fetch(CONFIG.CALL_CHANNEL_ID);
+        if (callChannel) {
+            await cleanupOldPanels(callChannel, 'Maak een call aan');
+            await callChannel.send(buildCallPanel());
+            console.log('Call panel gestuurd');
+        }
+    } catch (err) {
+        console.error('Fout bij call panel:', err);
     }
 });
 
@@ -554,9 +773,33 @@ client.on('messageCreate', async (message) => {
     }
 });
 
+// --- CALL: eigenaar verlaat call -> kanaal verwijderen ---
+client.on('voiceStateUpdate', async (oldState, newState) => {
+    const channelId = oldState.channelId;
+    if (!channelId) return;
+    if (!activeCalls.has(channelId)) return;
+    if (oldState.channelId === newState.channelId) return;
+
+    const call = activeCalls.get(channelId);
+    if (!call) return;
+    if (oldState.id !== call.ownerId) return;
+
+    // Eigenaar is uit de call gegaan -> verwijder kanaal
+    try {
+        const channel = await client.channels.fetch(channelId).catch(() => null);
+        if (channel) await channel.delete('Call eigenaar heeft de call verlaten').catch(() => {});
+    } catch (err) {
+        console.error('Fout bij verwijderen call:', err);
+    }
+
+    activeCalls.delete(channelId);
+    callAllowed.delete(channelId);
+});
+
 // --- INTERACTIONS ---
 client.on('interactionCreate', async (interaction) => {
 
+    // --- SLASH COMMANDS ---
     if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'clear') {
             const amount = interaction.options.getInteger('amount');
@@ -575,114 +818,4 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (interaction.commandName === 'antinuke') {
-            if (!CONFIG.ANTINUKE_ALLOWED_USERS.includes(interaction.user.id)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om dit te gebruiken.', flags: MessageFlags.Ephemeral });
-            }
-
-            const actie = interaction.options.getString('actie');
-
-            if (actie === 'enable') {
-                if (antinukeData.enabled) {
-                    return interaction.reply({ content: 'Anti-nuke is al ingeschakeld.', flags: MessageFlags.Ephemeral });
-                }
-                antinukeData.enabled = true;
-                saveJson(ANTINUKE_FILE, antinukeData);
-                await sendLog(interaction.guild, {
-                    title: '🛡️ Anti-nuke ingeschakeld',
-                    description: `Ingeschakeld door ${interaction.user.tag}.`,
-                    color: '#2ecc71'
-                });
-                return interaction.reply({ content: 'Anti-nuke is nu **ingeschakeld**.', flags: MessageFlags.Ephemeral });
-            }
-
-            if (actie === 'disable') {
-                if (!antinukeData.enabled) {
-                    return interaction.reply({ content: 'Anti-nuke is al uitgeschakeld.', flags: MessageFlags.Ephemeral });
-                }
-                antinukeData.enabled = false;
-                saveJson(ANTINUKE_FILE, antinukeData);
-                await sendLog(interaction.guild, {
-                    title: '🛡️ Anti-nuke uitgeschakeld',
-                    description: `Uitgeschakeld door ${interaction.user.tag}.`,
-                    color: '#e74c3c'
-                });
-                return interaction.reply({ content: 'Anti-nuke is nu **uitgeschakeld**.', flags: MessageFlags.Ephemeral });
-            }
-        }
-        return;
-    }
-
-    if (!interaction.isButton()) return;
-
-    if (interaction.customId === CONFIG.VERIFY_BUTTON_ID) {
-        try {
-            const role = interaction.guild.roles.cache.get(CONFIG.VERIFY_ROLE_ID);
-            if (!role) {
-                return interaction.reply({ content: 'De verify rol is niet gevonden. Neem contact op met een admin.', flags: MessageFlags.Ephemeral });
-            }
-
-            if (interaction.member.roles.cache.has(CONFIG.VERIFY_ROLE_ID)) {
-                return interaction.reply({ content: 'Je bent al geverifieerd!', flags: MessageFlags.Ephemeral });
-            }
-
-            await interaction.member.roles.add(role);
-
-            const newCount = await countRoleMembers(interaction.guild, CONFIG.VERIFY_ROLE_ID);
-            const newRow = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(CONFIG.VERIFY_BUTTON_ID)
-                    .setLabel(`${newCount}`)
-                    .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success)
-            );
-            await interaction.message.edit({ components: [newRow] }).catch(() => {});
-
-            await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Familie Zoet.', flags: MessageFlags.Ephemeral });
-        } catch (err) {
-            console.error('Fout bij verify:', err);
-            if (!interaction.replied) {
-                await interaction.reply({ content: 'Er ging iets mis. Probeer het later opnieuw.', flags: MessageFlags.Ephemeral }).catch(() => {});
-            }
-        }
-        return;
-    }
-
-    if (interaction.customId === CONFIG.SNAP_BUTTON_ID) {
-        try {
-            const role = interaction.guild.roles.cache.get(CONFIG.SNAP_ROLE_ID);
-            if (!role) {
-                return interaction.reply({ content: 'De Snapchat Ping rol is niet gevonden. Neem contact op met een admin.', flags: MessageFlags.Ephemeral });
-            }
-
-            if (interaction.member.roles.cache.has(CONFIG.SNAP_ROLE_ID)) {
-                return interaction.reply({ content: 'Je hebt de Snapchat Ping rol al!', flags: MessageFlags.Ephemeral });
-            }
-
-            await interaction.member.roles.add(role);
-
-            const newCount = await countRoleMembers(interaction.guild, CONFIG.SNAP_ROLE_ID);
-            const newRow = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(CONFIG.SNAP_BUTTON_ID)
-                    .setLabel(`${newCount}`)
-                    .setEmoji('👻')
-                    .setStyle(ButtonStyle.Primary)
-            );
-            await interaction.message.edit({ components: [newRow] }).catch(() => {});
-
-            await interaction.reply({ content: 'Je hebt de Snapchat Ping rol gekregen. Je krijgt nu een ping als er snaps gedropped worden.', flags: MessageFlags.Ephemeral });
-        } catch (err) {
-            console.error('Fout bij snapchat ping:', err);
-            if (!interaction.replied) {
-                await interaction.reply({ content: 'Er ging iets mis. Probeer het later opnieuw.', flags: MessageFlags.Ephemeral }).catch(() => {});
-            }
-        }
-    }
-});
-
-client.on('error', (err) => {
-    console.error('Client error:', err);
-});
-
-// --- LOGIN ---
-client.login(CONFIG.TOKEN);
+            if (!CONFIG.ANTINUKE_ALLOWED_USERS.includes(interaction
