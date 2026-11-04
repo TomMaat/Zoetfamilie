@@ -217,27 +217,22 @@ const client = new Client({
 const actionTracker = new Map();
 const activeCalls = new Map();
 const callAllowed = new Map();
-const roleCountCache = new Map(); // roleId -> { count, fetchedAt }
+const roleCountCache = new Map();
+// Bewaart het originele ephemeral bericht per kanaal voor updates
+const callInfoMessages = new Map();
 
 // --- HELPERS ---
-
-// Telt leden met een rol, gebruikt cache en doet max 1 fetch per minuut
 async function countRoleMembers(guild, roleId, forceFetch = false) {
     const now = Date.now();
     const cached = roleCountCache.get(roleId);
-
-    // Gebruik cache als die minder dan 60s oud is en niet geforceerd
     if (!forceFetch && cached && now - cached.fetchedAt < 60000) {
         return cached.count;
     }
-
     try {
         await guild.members.fetch();
     } catch (err) {
-        // Bij rate limit: gebruik cache of fallback naar role.members.size
         console.error('Fout bij members fetch:', err.message);
     }
-
     const role = guild.roles.cache.get(roleId);
     const count = role ? role.members.size : 0;
     roleCountCache.set(roleId, { count, fetchedAt: now });
@@ -293,7 +288,6 @@ async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
         );
         if (!panel) return;
 
-        // Geen fetch forceren; gebruik cache
         const count = await countRoleMembers(channel.guild, roleId, false);
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -453,6 +447,7 @@ async function setupCallCategory(guild) {
     }
 }
 
+// Bouwt de ephemeral info: toegangslijst + knoppen
 function buildCallInfoMessage(channelId, ownerId, isPrivate) {
     const allowed = callAllowed.get(channelId) || new Set();
 
@@ -497,6 +492,58 @@ function buildCallInfoMessage(channelId, ownerId, isPrivate) {
         );
     }
 
+    // Verberg-knop voor het ephemeral bericht
+    rows.push(
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`call_hide_${channelId}`)
+                .setLabel('Verberg dit bericht')
+                .setEmoji('🙈')
+                .setStyle(ButtonStyle.Secondary),
+            new ButtonBuilder()
+                .setCustomId(`call_delete_${channelId}`)
+                .setLabel('Verwijder call')
+                .setEmoji('🗑️')
+                .setStyle(ButtonStyle.Danger)
+        )
+    );
+
+    return { embeds: [embed], components: rows };
+}
+
+// Bouwt het permanente bericht in het call-kanaal (zichtbaar voor eigenaar)
+function buildCallControlMessage(channelId, ownerId, isPrivate) {
+    const embed = new EmbedBuilder()
+        .setTitle(isPrivate ? '🔒 Privé call' : '🔊 Openbare call')
+        .setDescription(
+            `**Eigenaar:** <@${ownerId}>\n` +
+            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n\n` +
+            (isPrivate
+                ? 'Alleen de eigenaar kan mensen toelaten of verwijderen via de knoppen hieronder.'
+                : 'Iedereen met verify kan joinen.')
+        )
+        .setColor(isPrivate ? '#e74c3c' : '#2ecc71')
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
+
+    const rows = [];
+
+    if (isPrivate) {
+        rows.push(
+            new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`call_allow_${channelId}`)
+                    .setLabel('Iemand toelaten')
+                    .setEmoji('✅')
+                    .setStyle(ButtonStyle.Success),
+                new ButtonBuilder()
+                    .setCustomId(`call_remove_${channelId}`)
+                    .setLabel('Iemand verwijderen')
+                    .setEmoji('➖')
+                    .setStyle(ButtonStyle.Secondary)
+            )
+        );
+    }
+
     rows.push(
         new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -508,6 +555,24 @@ function buildCallInfoMessage(channelId, ownerId, isPrivate) {
     );
 
     return { embeds: [embed], components: rows };
+}
+
+// Werkt de ephemeral info bij. Probeert eerst de originele reply te editen,
+// anders stuurt het een nieuwe ephemeral.
+async function updateCallInfo(interaction, channelId, ownerId, isPrivate) {
+    const payload = buildCallInfoMessage(channelId, ownerId, isPrivate);
+    try {
+        if (interaction.deferred || interaction.replied) {
+            await interaction.editReply(payload).catch(() => {});
+        } else {
+            await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+        }
+    } catch (err) {
+        // fallback: nieuwe ephemeral
+        try {
+            await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
+        } catch (e) {}
+    }
 }
 
 async function createCall(interaction, name, isPrivate) {
@@ -559,8 +624,15 @@ async function createCall(interaction, name, isPrivate) {
     });
     callAllowed.set(channel.id, new Set([member.id]));
 
+    // Stuur het permanente controlebericht in het call-kanaal
+    const controlMsg = await channel.send(buildCallControlMessage(channel.id, member.id, isPrivate)).catch(() => null);
+    if (controlMsg) {
+        callInfoMessages.set(channel.id, controlMsg.id);
+    }
+
+    // Ephemeral info voor de eigenaar in het aanmaakkanaal
     const payload = buildCallInfoMessage(channel.id, member.id, isPrivate);
-    await interaction.editReply(payload);
+    await interaction.editReply(payload).catch(() => {});
 
     await sendLog(guild, CONFIG.CALL_LOG_ID, {
         title: isPrivate ? '🔒 Privé call gemaakt' : '🔊 Openbare call gemaakt',
@@ -613,7 +685,6 @@ client.once('clientReady', async () => {
         console.error('Fout bij registreren commands:', err);
     }
 
-    // Verify panel — geen geforceerde fetch meer
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
@@ -637,7 +708,6 @@ client.once('clientReady', async () => {
         console.error('Fout bij verify panel:', err);
     }
 
-    // Wacht 5 seconden voor snapchat panel om rate limit te vermijden
     await new Promise(r => setTimeout(r, 5000));
 
     try {
@@ -768,6 +838,7 @@ client.on('guildMemberRemove', async (member) => {
     });
 
     if (hadVerify) {
+        roleCountCache.delete(CONFIG.VERIFY_ROLE_ID);
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
         await sendLog(member.guild, CONFIG.VERIFY_LOG_ID, {
             title: '❌ Verify verlaten',
@@ -778,6 +849,7 @@ client.on('guildMemberRemove', async (member) => {
     }
 
     if (hadSnap) {
+        roleCountCache.delete(CONFIG.SNAP_ROLE_ID);
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
         await sendLog(member.guild, CONFIG.SNAP_LOG_ID, {
             title: '❌ Snapchat Ping verlaten',
@@ -923,6 +995,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
         }
         activeCalls.delete(channelId);
         callAllowed.delete(channelId);
+        callInfoMessages.delete(channelId);
         return;
     }
 
@@ -943,6 +1016,7 @@ async function checkEmptyCalls() {
             if (!channel) {
                 activeCalls.delete(channelId);
                 callAllowed.delete(channelId);
+                callInfoMessages.delete(channelId);
                 continue;
             }
 
@@ -963,6 +1037,7 @@ async function checkEmptyCalls() {
                 await channel.delete('Call was leeg voor 1 uur').catch(() => {});
                 activeCalls.delete(channelId);
                 callAllowed.delete(channelId);
+                callInfoMessages.delete(channelId);
                 console.log(`Lege call verwijderd: ${channelId}`);
             }
         } catch (err) {
@@ -1024,13 +1099,12 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
-    // Modal submit: DEFER eerst, dan kanaal maken
+    // Modal submit: defer eerst
     if (interaction.isModalSubmit()) {
         if (interaction.customId === 'call_modal_public' || interaction.customId === 'call_modal_private') {
             const isPrivate = interaction.customId === 'call_modal_private';
             const name = interaction.fields.getTextInputValue('call_name');
 
-            // Defer meteen zodat de interaction niet verloopt
             await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
 
             try {
@@ -1062,7 +1136,17 @@ client.on('interactionCreate', async (interaction) => {
                 await channel.permissionOverwrites.edit(userId, { ViewChannel: true, Connect: true });
                 if (!callAllowed.has(channelId)) callAllowed.set(channelId, new Set());
                 callAllowed.get(channelId).add(userId);
+
+                // Update het permanente bericht in de call
+                await updateCallControlMessage(channelId, call.ownerId, call.isPrivate);
+
                 await interaction.reply({ content: `<@${userId}> is toegelaten tot de call.`, flags: MessageFlags.Ephemeral });
+
+                // Nieuwe ephemeral met bijgewerkte lijst
+                try {
+                    const payload = buildCallInfoMessage(channelId, call.ownerId, call.isPrivate);
+                    await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
+                } catch (e) {}
 
                 await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
                     title: '✅ Toegelaten tot call',
@@ -1101,7 +1185,14 @@ client.on('interactionCreate', async (interaction) => {
                     await voiceMember.voice.disconnect('Verwijderd uit call door eigenaar').catch(() => {});
                 }
 
+                await updateCallControlMessage(channelId, call.ownerId, call.isPrivate);
+
                 await interaction.reply({ content: `<@${userId}> is verwijderd uit de call.`, flags: MessageFlags.Ephemeral });
+
+                try {
+                    const payload = buildCallInfoMessage(channelId, call.ownerId, call.isPrivate);
+                    await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
+                } catch (e) {}
 
                 await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
                     title: '➖ Verwijderd uit call',
@@ -1175,6 +1266,13 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.reply({ content: 'Kies een lid om te verwijderen:', components: [selectRow], flags: MessageFlags.Ephemeral });
     }
 
+    if (interaction.customId.startsWith('call_hide_')) {
+        try {
+            await interaction.update({ content: '🙈 Bericht verborgen. Je kan de knoppen in het call-kanaal gebruiken.', embeds: [], components: [] });
+        } catch (err) {}
+        return;
+    }
+
     if (interaction.customId.startsWith('call_delete_')) {
         const channelId = interaction.customId.replace('call_delete_', '');
         const call = activeCalls.get(channelId);
@@ -1193,6 +1291,7 @@ client.on('interactionCreate', async (interaction) => {
         }
         activeCalls.delete(channelId);
         callAllowed.delete(channelId);
+        callInfoMessages.delete(channelId);
 
         try {
             await interaction.update({ content: '🗑️ Call verwijderd.', embeds: [], components: [] });
@@ -1263,6 +1362,25 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 });
+
+// Werkt het permanente controlebericht in het call-kanaal bij
+async function updateCallControlMessage(channelId, ownerId, isPrivate) {
+    try {
+        const channel = await client.channels.fetch(channelId).catch(() => null);
+        if (!channel) return;
+
+        const controlId = callInfoMessages.get(channelId);
+        if (!controlId) return;
+
+        const msg = await channel.messages.fetch(controlId).catch(() => null);
+        if (!msg) return;
+
+        const payload = buildCallControlMessage(channelId, ownerId, isPrivate);
+        await msg.edit(payload).catch(() => {});
+    } catch (err) {
+        console.error('Fout bij updaten call control message:', err);
+    }
+}
 
 client.on('error', (err) => {
     console.error('Client error:', err);
