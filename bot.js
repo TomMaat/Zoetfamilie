@@ -28,6 +28,15 @@ http.createServer((req, res) => {
     console.log(`HTTP server luistert op poort ${PORT}`);
 });
 
+// --- PAARS THEMA ---
+const PURPLE = {
+    main: '#9b59b6',
+    dark: '#7d3c98',
+    light: '#bb8fce',
+    accent: '#a569bd',
+    soft: '#d2b4de'
+};
+
 // --- INSTELLINGEN ---
 const CONFIG = {
     TOKEN: process.env.DISCORD_TOKEN,
@@ -55,6 +64,9 @@ const CONFIG = {
     CALL_LOG_ID: '1567547888119058562',
     JOIN_LEAVE_LOG_ID: '1567549266635788370',
 
+    MEMBERS_LIST_CHANNEL_ID: '1567644680659927121',
+    LID_ROLE_ID: '1567227107258671145',
+
     EMPTY_CALL_TIMEOUT_MS: 60 * 60 * 1000,
     EMPTY_CALL_CHECK_MS: 5 * 60 * 1000,
 
@@ -71,6 +83,18 @@ const CONFIG = {
     },
     ANTINUKE_WINDOW_MS: 10000
 };
+
+// --- RANGEN (geen emoji's) ---
+const RANKS = [
+    { name: '𝐙𝐨𝐞𝐭 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106', level: 6 },
+    { name: '𝐙𝐨𝐞𝐭 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450', level: 5 },
+    { name: '𝐙𝐨𝐞𝐭 𝐃𝐢𝐜𝐭𝐚𝐭𝐨𝐫', roleId: '1567245029255413890', level: 4 },
+    { name: '𝐙𝐨𝐞𝐭 𝐋𝐮𝐢𝐭𝐞𝐧𝐚𝐧𝐭', roleId: '1567264503744299109', level: 3 },
+    { name: '𝐙𝐨𝐞𝐭 𝐆𝐞𝐧𝐞𝐫𝐚𝐥', roleId: '1567246499069566987', level: 2 },
+    { name: '𝐙𝐨𝐞𝐭 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459', level: 1 }
+];
+const SORTED_RANKS = [...RANKS].sort((a, b) => b.level - a.level);
+const WATCHED_ROLE_IDS = new Set(RANKS.map(r => r.roleId));
 
 // --- GIST DATABASE ---
 const GIST_FILE = 'zoet.json';
@@ -220,6 +244,9 @@ const callAllowed = new Map();
 const roleCountCache = new Map();
 const callInfoMessages = new Map();
 
+let membersListMessageId = null;
+let membersUpdateTimeout = null;
+
 // --- HELPERS ---
 async function countRoleMembers(guild, roleId, forceFetch = false) {
     const now = Date.now();
@@ -308,7 +335,7 @@ async function sendLog(guild, channelId, { title, description, color, thumbnail 
         const embed = new EmbedBuilder()
             .setTitle(title)
             .setDescription(description)
-            .setColor(color)
+            .setColor(color || PURPLE.main)
             .setTimestamp();
         if (thumbnail) embed.setThumbnail(thumbnail);
         else embed.setThumbnail(CONFIG.LOGO_URL);
@@ -327,7 +354,7 @@ function buildHoneypotEmbed() {
             `**Totaal aantal kicks:** ${kickData.total}\n\n` +
             '🛡️ **Dit kanaal wordt 24/7 automatisch gecontroleerd**'
         )
-        .setColor('#f7c948')
+        .setColor(PURPLE.main)
         .setThumbnail(CONFIG.LOGO_URL);
 }
 
@@ -345,6 +372,96 @@ async function refreshHoneypotEmbed(channel) {
     } catch (err) {
         console.error('Fout bij updaten honeypot embed:', err);
     }
+}
+
+// --- LEDENLIJST (paars, geen emoji's bij rangen) ---
+function buildMembersEmbed(guild) {
+    let body = '';
+    const uniqueMembers = new Set();
+
+    for (const rank of SORTED_RANKS) {
+        const role = guild.roles.cache.get(rank.roleId);
+        if (!role) {
+            body += `**${rank.name} (0)**\n➤ Rol niet gevonden\n\n`;
+            continue;
+        }
+
+        const members = [...role.members.values()]
+            .map(m => ({ id: m.id, name: m.displayName }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+
+        for (const m of members) uniqueMembers.add(m.id);
+
+        body += `**${rank.name} (${members.length})**\n`;
+        if (members.length > 0) {
+            for (const m of members) body += `➤ <@${m.id}>\n`;
+        } else {
+            body += `➤ Geen leden\n`;
+        }
+        body += `\n`;
+    }
+
+    const lidRole = guild.roles.cache.get(CONFIG.LID_ROLE_ID);
+    const lidCount = lidRole ? lidRole.members.size : 0;
+
+    const description = `**Totaal Familie Zoet: ${uniqueMembers.size} leden**\n` +
+        `**Algemeen leden: ${lidCount}**\n\n${body}`;
+
+    return new EmbedBuilder()
+        .setTitle('🏴 Familie Zoet Ledenlijst')
+        .setColor(PURPLE.main)
+        .setDescription(description.slice(0, 4096))
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setTimestamp();
+}
+
+async function updateMembersList() {
+    try {
+        const guild = client.guilds.cache.first();
+        if (!guild) return;
+
+        const channel = await client.channels.fetch(CONFIG.MEMBERS_LIST_CHANNEL_ID).catch(() => null);
+        if (!channel || !channel.isTextBased()) {
+            console.log('Ledenlijst kanaal niet gevonden');
+            return;
+        }
+
+        const embed = buildMembersEmbed(guild);
+        const payload = { embeds: [embed], allowedMentions: { parse: [] } };
+
+        if (membersListMessageId) {
+            try {
+                const existing = await channel.messages.fetch(membersListMessageId);
+                await existing.edit(payload);
+                return;
+            } catch (err) {
+                membersListMessageId = null;
+            }
+        }
+
+        try {
+            const fetched = await channel.messages.fetch({ limit: 50 });
+            const botMessages = fetched.filter(m => m.author.id === client.user.id);
+            for (const m of botMessages.values()) {
+                await m.delete().catch(() => {});
+            }
+        } catch (err) {}
+
+        const sent = await channel.send(payload);
+        membersListMessageId = sent.id;
+        console.log('Ledenlijst gestuurd');
+    } catch (err) {
+        console.error('Fout bij updaten ledenlijst:', err);
+    }
+}
+
+function scheduleMembersUpdate() {
+    if (membersUpdateTimeout) return;
+    membersUpdateTimeout = setTimeout(() => {
+        membersUpdateTimeout = null;
+        updateMembersList().catch(() => {});
+    }, 3000);
 }
 
 // --- ANTI-NUKE ---
@@ -385,7 +502,7 @@ async function punishUser(guild, userId, reason) {
         await sendLog(guild, CONFIG.JOIN_LEAVE_LOG_ID, {
             title: '🚨 Anti-nuke actie',
             description: `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n**Reden:** ${reason}`,
-            color: '#e74c3c',
+            color: PURPLE.dark,
             thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     } catch (err) {
@@ -414,7 +531,7 @@ function buildCallPanel() {
             '**Privé** — alleen jij kan mensen toelaten.\n\n' +
             '**Kantoor** — stuur je eigen call-paneel opnieuw om mensen toe te voegen of te verwijderen.'
         )
-        .setColor('#5865f2')
+        .setColor(PURPLE.main)
         .setThumbnail(CONFIG.LOGO_URL);
 
     const row = new ActionRowBuilder().addComponents(
@@ -474,7 +591,7 @@ function buildCallInfoMessage(channelId, ownerId, isPrivate) {
                 ? 'Alleen jij kan mensen toelaten of verwijderen.'
                 : 'Iedereen met verify kan joinen.')
         )
-        .setColor(isPrivate ? '#e74c3c' : '#2ecc71')
+        .setColor(PURPLE.main)
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
 
     const rows = [];
@@ -524,7 +641,7 @@ function buildCallControlMessage(channelId, ownerId, isPrivate) {
                 ? 'Alleen de eigenaar kan mensen toelaten of verwijderen via de knoppen hieronder.'
                 : 'Iedereen met verify kan joinen.')
         )
-        .setColor(isPrivate ? '#e74c3c' : '#2ecc71')
+        .setColor(PURPLE.main)
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
 
     const rows = [];
@@ -637,7 +754,7 @@ async function createCall(interaction, name, isPrivate) {
     await sendLog(guild, CONFIG.CALL_LOG_ID, {
         title: isPrivate ? '🔒 Privé call gemaakt' : '🔊 Openbare call gemaakt',
         description: `**Eigenaar:** ${member.user.tag} (\`${member.id}\`)\n**Kanaal:** <#${channel.id}>`,
-        color: isPrivate ? '#e74c3c' : '#2ecc71',
+        color: PURPLE.main,
         thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
     });
 }
@@ -677,7 +794,10 @@ client.once('clientReady', async () => {
                             { name: 'enable', value: 'enable' },
                             { name: 'disable', value: 'disable' }
                         )
-                )
+                ),
+            new SlashCommandBuilder()
+                .setName('refresh')
+                .setDescription('Werk de ledenlijst handmatig bij')
         ].map(c => c.toJSON());
         await client.application.commands.set(commands);
         console.log('Slash commands geregistreerd');
@@ -693,7 +813,7 @@ client.once('clientReady', async () => {
             const embed = new EmbedBuilder()
                 .setTitle('Familie Zoet Verification')
                 .setDescription('Welkom bij Familie Zoet!\n\nKlik op de knop hieronder om jezelf te verifiëren en toegang te krijgen tot de server.')
-                .setColor('#2b2d31')
+                .setColor(PURPLE.main)
                 .setThumbnail(CONFIG.LOGO_URL);
             const button = new ButtonBuilder()
                 .setCustomId(CONFIG.VERIFY_BUTTON_ID)
@@ -721,7 +841,7 @@ client.once('clientReady', async () => {
                     'Klik op de knop hieronder om de **Snapchat Ping** rol te krijgen.\n\n' +
                     'Je krijgt dan een ping wanneer er snaps gedropped worden.'
                 )
-                .setColor('#f7c948')
+                .setColor(PURPLE.main)
                 .setThumbnail(CONFIG.LOGO_URL);
             const button = new ButtonBuilder()
                 .setCustomId(CONFIG.SNAP_BUTTON_ID)
@@ -759,6 +879,8 @@ client.once('clientReady', async () => {
         console.error('Fout bij call panel:', err);
     }
 
+    await updateMembersList();
+
     setInterval(checkEmptyCalls, CONFIG.EMPTY_CALL_CHECK_MS);
     console.log(`Lege-call checker gestart (elke ${CONFIG.EMPTY_CALL_CHECK_MS / 60000} min, timeout ${CONFIG.EMPTY_CALL_TIMEOUT_MS / 60000} min)`);
 });
@@ -766,6 +888,7 @@ client.once('clientReady', async () => {
 // --- WELCOME + DM + JOIN LOG ---
 client.on('guildMemberAdd', async (member) => {
     updateStatus(member.guild);
+    scheduleMembersUpdate();
 
     joinTimes[member.id] = Date.now();
     await saveToGist();
@@ -780,7 +903,7 @@ client.on('guildMemberAdd', async (member) => {
                     `Je bent lid **${memberCount}** van **${CONFIG.SERVER_NAME}**.`
                 )
                 .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
-                .setColor('#2b2d31')
+                .setColor(PURPLE.main)
                 .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
             await channel.send({ embeds: [embed] }).catch(() => {});
         }
@@ -796,7 +919,7 @@ client.on('guildMemberAdd', async (member) => {
                 `Leuk dat je er bent. Verifieer jezelf in <#${CONFIG.VERIFY_CHANNEL_ID}> om toegang te krijgen tot de server.\n\n` +
                 `Als je vragen hebt, kan je altijd een admin aanspreken.`
             )
-            .setColor('#2b2d31')
+            .setColor(PURPLE.main)
             .setThumbnail(CONFIG.LOGO_URL);
         await member.send({ embeds: [dmEmbed] });
     } catch (err) {}
@@ -807,13 +930,14 @@ client.on('guildMemberAdd', async (member) => {
             `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n` +
             `**Account aangemaakt:** <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>\n` +
             `**Leden nu:** ${member.guild.memberCount}`,
-        color: '#2ecc71',
+        color: PURPLE.main,
         thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
     });
 });
 
 client.on('guildMemberRemove', async (member) => {
     updateStatus(member.guild);
+    scheduleMembersUpdate();
 
     const joinedAt = joinTimes[member.id];
     let durationText = 'Onbekend';
@@ -833,7 +957,7 @@ client.on('guildMemberRemove', async (member) => {
             `**In server voor:** ${durationText}\n` +
             `**Had verify:** ${hadVerify ? 'ja' : 'nee'}\n` +
             `**Had snapchat ping:** ${hadSnap ? 'ja' : 'nee'}`,
-        color: '#e74c3c',
+        color: PURPLE.dark,
         thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
     });
 
@@ -843,7 +967,7 @@ client.on('guildMemberRemove', async (member) => {
         await sendLog(member.guild, CONFIG.VERIFY_LOG_ID, {
             title: '❌ Verify verlaten',
             description: `${member.user.tag} (\`${member.id}\`) heeft de server verlaten en had de verify rol.`,
-            color: '#e74c3c',
+            color: PURPLE.dark,
             thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     }
@@ -854,7 +978,7 @@ client.on('guildMemberRemove', async (member) => {
         await sendLog(member.guild, CONFIG.SNAP_LOG_ID, {
             title: '❌ Snapchat Ping verlaten',
             description: `${member.user.tag} (\`${member.id}\`) heeft de server verlaten en had de Snapchat Ping rol.`,
-            color: '#e74c3c',
+            color: PURPLE.dark,
             thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     }
@@ -877,13 +1001,22 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const oldSnap = oldMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
     const newSnap = newMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
 
+    let rankChanged = false;
+    for (const id of WATCHED_ROLE_IDS) {
+        if (oldMember.roles.cache.has(id) !== newMember.roles.cache.has(id)) {
+            rankChanged = true;
+            break;
+        }
+    }
+    if (rankChanged) scheduleMembersUpdate();
+
     if (!oldVerify && newVerify) {
         roleCountCache.delete(CONFIG.VERIFY_ROLE_ID);
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
         await sendLog(newMember.guild, CONFIG.VERIFY_LOG_ID, {
             title: '✅ Verify gekregen',
             description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de verify rol gekregen.`,
-            color: '#2ecc71',
+            color: PURPLE.main,
             thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
         try {
@@ -893,7 +1026,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
                     `Bedankt voor het verifiëren bij **${CONFIG.SERVER_NAME}**!\n\n` +
                     `Je hebt nu toegang tot de server. Veel plezier! 🎉`
                 )
-                .setColor('#2ecc71')
+                .setColor(PURPLE.main)
                 .setThumbnail(CONFIG.LOGO_URL);
             await newMember.send({ embeds: [dmEmbed] });
         } catch (err) {}
@@ -903,7 +1036,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
         await sendLog(newMember.guild, CONFIG.VERIFY_LOG_ID, {
             title: '❌ Verify verwijderd',
             description: `${newMember.user.tag} (\`${newMember.id}\`) is niet meer geverifieerd.`,
-            color: '#e74c3c',
+            color: PURPLE.dark,
             thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     }
@@ -914,7 +1047,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
         await sendLog(newMember.guild, CONFIG.SNAP_LOG_ID, {
             title: '👻 Snapchat Ping gekregen',
             description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de Snapchat Ping rol gekregen.`,
-            color: '#f7c948',
+            color: PURPLE.main,
             thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     } else if (oldSnap && !newSnap) {
@@ -923,7 +1056,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
         await sendLog(newMember.guild, CONFIG.SNAP_LOG_ID, {
             title: '❌ Snapchat Ping verwijderd',
             description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de Snapchat Ping rol niet meer.`,
-            color: '#e74c3c',
+            color: PURPLE.dark,
             thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     }
@@ -967,7 +1100,7 @@ client.on('messageCreate', async (message) => {
                 `**Actie:** KICK\n` +
                 `**Totaal aantal kicks:** ${kickData.total}`
             )
-            .setColor('#e74c3c')
+            .setColor(PURPLE.dark)
             .setTimestamp();
         await message.channel.send({ embeds: [embed] }).catch(() => {});
     } catch (err) {
@@ -1078,7 +1211,7 @@ client.on('interactionCreate', async (interaction) => {
                 await sendLog(interaction.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
                     title: '🛡️ Anti-nuke ingeschakeld',
                     description: `Ingeschakeld door ${interaction.user.tag}.`,
-                    color: '#2ecc71'
+                    color: PURPLE.main
                 });
                 return interaction.reply({ content: 'Anti-nuke is nu **ingeschakeld**.', flags: MessageFlags.Ephemeral });
             }
@@ -1091,9 +1224,20 @@ client.on('interactionCreate', async (interaction) => {
                 await sendLog(interaction.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
                     title: '🛡️ Anti-nuke uitgeschakeld',
                     description: `Uitgeschakeld door ${interaction.user.tag}.`,
-                    color: '#e74c3c'
+                    color: PURPLE.dark
                 });
                 return interaction.reply({ content: 'Anti-nuke is nu **uitgeschakeld**.', flags: MessageFlags.Ephemeral });
+            }
+        }
+
+        if (interaction.commandName === 'refresh') {
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            try {
+                await updateMembersList();
+                await interaction.editReply({ content: '✅ Ledenlijst bijgewerkt.' });
+            } catch (err) {
+                console.error('Fout bij refresh:', err);
+                await interaction.editReply({ content: '❌ Kon ledenlijst niet bijwerken.' });
             }
         }
         return;
@@ -1148,7 +1292,7 @@ client.on('interactionCreate', async (interaction) => {
                 await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
                     title: '✅ Toegelaten tot call',
                     description: `**Eigenaar:** <@${call.ownerId}>\n**Toegelaten:** <@${userId}>\n**Call:** <#${channelId}>`,
-                    color: '#2ecc71'
+                    color: PURPLE.main
                 });
             } catch (err) {
                 console.error('Fout bij toelaten user:', err);
@@ -1194,7 +1338,7 @@ client.on('interactionCreate', async (interaction) => {
                 await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
                     title: '➖ Verwijderd uit call',
                     description: `**Eigenaar:** <@${call.ownerId}>\n**Verwijderd:** <@${userId}>\n**Call:** <#${channelId}>`,
-                    color: '#e74c3c'
+                    color: PURPLE.dark
                 });
             } catch (err) {
                 console.error('Fout bij verwijderen user uit call:', err);
@@ -1223,7 +1367,6 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.showModal(modal);
     }
 
-    // Kantoor-knop: stuur het paneel opnieuw voor de calls waar jij eigenaar van bent
     if (interaction.customId === 'call_office_panel') {
         const myCalls = [];
         for (const [channelId, call] of activeCalls.entries()) {
@@ -1239,7 +1382,6 @@ client.on('interactionCreate', async (interaction) => {
             });
         }
 
-        // Stuur voor elke eigen call een ephemeral paneel
         for (let i = 0; i < myCalls.length; i++) {
             const c = myCalls[i];
             const payload = buildCallInfoMessage(c.channelId, c.ownerId, c.isPrivate);
@@ -1326,7 +1468,7 @@ client.on('interactionCreate', async (interaction) => {
         await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
             title: '🗑️ Call verwijderd',
             description: `**Eigenaar:** <@${call.ownerId}>\n**Kanaal:** <#${channelId}>`,
-            color: '#e74c3c'
+            color: PURPLE.dark
         });
         return;
     }
