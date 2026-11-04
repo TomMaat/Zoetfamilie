@@ -20,6 +20,7 @@ const {
     StringSelectMenuBuilder
 } = require('discord.js');
 
+// --- KLEINE HTTP SERVER ZODAT RENDER EEN POORT ZIET ---
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -37,6 +38,7 @@ const PURPLE = {
     soft: '#d2b4de'
 };
 
+// --- INSTELLINGEN ---
 const CONFIG = {
     TOKEN: process.env.DISCORD_TOKEN,
     GITHUB_TOKEN: process.env.GITHUB_TOKEN,
@@ -65,13 +67,8 @@ const CONFIG = {
 
     MEMBERS_LIST_CHANNEL_ID: '1567644680659927121',
     CUSTOM_ROLE_PANEL_CHANNEL_ID: '1567647760382038086',
-    LID_ROLE_ID: '1567227107258671145',
 
-    // Alleen deze users mogen custom roles beheren
-    CUSTOM_ROLE_MANAGERS: [
-        '1033753872927293520',
-        '1559586201348866050'
-    ],
+    CUSTOM_ROLE_MANAGER: '1567237645057261689',
 
     EMPTY_CALL_TIMEOUT_MS: 60 * 60 * 1000,
     EMPTY_CALL_CHECK_MS: 5 * 60 * 1000,
@@ -90,7 +87,7 @@ const CONFIG = {
     ANTINUKE_WINDOW_MS: 10000
 };
 
-// --- VASTE RANGEN ---
+// --- VASTE RANGEN (in ledenlijst) ---
 const FIXED_RANKS = [
     { name: '𝐙𝐨𝐞𝐭 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106', level: 100 },
     { name: '𝐙𝐨𝐞𝐭 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450', level: 90 },
@@ -100,8 +97,18 @@ const FIXED_RANKS = [
     { name: '𝐙𝐨𝐞𝐭 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459', level: 50 }
 ];
 
-// Custom rollen worden uit de Gist geladen
+// --- CUSTOM ROLES ---
 let customRoles = []; // [{ name, roleId, order }]
+
+// Rollen die standaard als custom role in de Gist moeten staan
+const DEFAULT_CUSTOM_ROLES = [
+    { name: '𝐙𝐨𝐞𝐭 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106' },
+    { name: '𝐙𝐨𝐞𝐭 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450' },
+    { name: '𝐙𝐨𝐞𝐭 𝐃𝐢𝐜𝐭𝐚𝐭𝐨𝐫', roleId: '1567245029255413890' },
+    { name: '𝐙𝐨𝐞𝐭 𝐋𝐮𝐢𝐭𝐞𝐧𝐚𝐧𝐭', roleId: '1567264503744299109' },
+    { name: '𝐙𝐨𝐞𝐭 𝐆𝐞𝐧𝐞𝐫𝐚𝐥', roleId: '1567246499069566987' },
+    { name: '𝐙𝐨𝐞𝐭 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459' }
+];
 
 // --- GIST DATABASE ---
 const GIST_FILE = 'zoet.json';
@@ -181,9 +188,29 @@ async function loadFromGist() {
             if (data.joinTimes) joinTimes = data.joinTimes;
             if (Array.isArray(data.customRoles)) customRoles = data.customRoles;
         }
+        await migrateDefaultCustomRoles();
         console.log(`Database geladen: kicks=${kickData.total}, antinuke=${antinukeData.enabled}, customRoles=${customRoles.length}`);
     } catch (err) {
         console.error('Fout bij laden database:', err.message);
+    }
+}
+
+async function migrateDefaultCustomRoles() {
+    let changed = false;
+    const existingIds = new Set(customRoles.map(c => c.roleId));
+    for (const def of DEFAULT_CUSTOM_ROLES) {
+        if (!existingIds.has(def.roleId)) {
+            customRoles.push({
+                name: def.name,
+                roleId: def.roleId,
+                order: customRoles.length
+            });
+            changed = true;
+        }
+    }
+    if (changed) {
+        await saveToGist();
+        console.log(`Migratie: ${customRoles.length} custom rollen in Gist`);
     }
 }
 
@@ -258,7 +285,10 @@ let membersListMessageId = null;
 let membersUpdateTimeout = null;
 let customRolePanelMessageId = null;
 
-// --- HELPERS ---
+function isCustomRoleManager(userId) {
+    return userId === CONFIG.CUSTOM_ROLE_MANAGER;
+}
+
 async function countRoleMembers(guild, roleId, forceFetch = false) {
     const now = Date.now();
     const cached = roleCountCache.get(roleId);
@@ -385,7 +415,7 @@ async function refreshHoneypotEmbed(channel) {
     }
 }
 
-// --- LEDENLIJST (vaste rangen + custom rollen, geen algemeen-leden regel) ---
+// --- LEDENLIJST ---
 function getSortedCustomRoles() {
     return [...customRoles].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
 }
@@ -394,8 +424,10 @@ function buildMembersEmbed(guild) {
     let body = '';
     const uniqueMembers = new Set();
 
-    // Vaste rangen
+    // Eerst vaste rangen (die niet in customRoles zitten)
+    const customRoleIds = new Set(customRoles.map(c => c.roleId));
     for (const rank of FIXED_RANKS) {
+        if (customRoleIds.has(rank.roleId)) continue; // wordt al bij custom getoond
         const role = guild.roles.cache.get(rank.roleId);
         if (!role) {
             body += `**${rank.name} (0)**\n➤ Rol niet gevonden\n\n`;
@@ -411,7 +443,7 @@ function buildMembersEmbed(guild) {
         body += `\n`;
     }
 
-    // Custom rollen (in volgorde)
+    // Dan custom rollen (in volgorde)
     for (const cr of getSortedCustomRoles()) {
         const role = guild.roles.cache.get(cr.roleId);
         if (!role) {
@@ -496,7 +528,9 @@ function buildCustomRolePanelEmbed() {
     } else {
         for (let i = 0; i < sorted.length; i++) {
             const cr = sorted[i];
-            list += `**${i + 1}. ${cr.name}** — <@&${cr.roleId}>\n`;
+            const role = client.guilds.cache.first()?.roles.cache.get(cr.roleId);
+            const displayName = role ? role.name : cr.name;
+            list += `**${i + 1}. ${displayName}** — <@&${cr.roleId}>\n`;
         }
     }
 
@@ -505,7 +539,7 @@ function buildCustomRolePanelEmbed() {
         .setDescription(
             'Beheer hier de custom rollen van **Familie Zoet**.\n\n' +
             '**Huidige custom rollen:**\n' + list + '\n\n' +
-            'Gebruik de knoppen hieronder om rollen toe te voegen, te verwijderen of van volgorde te wisselen. Nieuwe rollen komen automatisch in het lettertype en verschijnen in de ledenlijst.'
+            'Alleen de beheerder kan rollen toevoegen, verwijderen, hernoemen of van volgorde wisselen. Nieuwe rollen komen automatisch in het lettertype en verschijnen in de ledenlijst.'
         )
         .setColor(PURPLE.main)
         .setThumbnail(CONFIG.LOGO_URL)
@@ -920,10 +954,10 @@ client.once('clientReady', async () => {
                 ),
             new SlashCommandBuilder()
                 .setName('refresh')
-                .setDescription('Werk de ledenlijst handmatig bij'),
+                .setDescription('Werk de ledenlijst en het custom role panel bij'),
             new SlashCommandBuilder()
                 .setName('customroles')
-                .setDescription('Toon of vernieuw het custom role panel')
+                .setDescription('Vernieuw het custom role panel')
         ].map(c => c.toJSON());
         await client.application.commands.set(commands);
         console.log('Slash commands geregistreerd');
@@ -1322,6 +1356,7 @@ async function checkEmptyCalls() {
 // --- INTERACTIONS ---
 client.on('interactionCreate', async (interaction) => {
 
+    // --- SLASH COMMANDS ---
     if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'clear') {
             const amount = interaction.options.getInteger('amount');
@@ -1383,6 +1418,9 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         if (interaction.commandName === 'customroles') {
+            if (!isCustomRoleManager(interaction.user.id)) {
+                return interaction.reply({ content: 'Je hebt geen toestemming om dit te gebruiken.', flags: MessageFlags.Ephemeral });
+            }
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             try {
                 await updateCustomRolePanel();
@@ -1395,9 +1433,8 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
-    // --- CUSTOM ROLE PANEL: MODALS ---
+    // --- MODALS ---
     if (interaction.isModalSubmit()) {
-        // Call modal
         if (interaction.customId === 'call_modal_public' || interaction.customId === 'call_modal_private') {
             const isPrivate = interaction.customId === 'call_modal_private';
             const name = interaction.fields.getTextInputValue('call_name');
@@ -1415,9 +1452,8 @@ client.on('interactionCreate', async (interaction) => {
             return;
         }
 
-        // Custom role toevoegen
         if (interaction.customId === 'cr_modal_add') {
-            if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+            if (!isCustomRoleManager(interaction.user.id)) {
                 return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
             }
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -1450,9 +1486,8 @@ client.on('interactionCreate', async (interaction) => {
             return;
         }
 
-        // Custom role hernoemen
         if (interaction.customId.startsWith('cr_modal_rename_')) {
-            if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+            if (!isCustomRoleManager(interaction.user.id)) {
                 return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
             }
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -1484,11 +1519,10 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
-    // --- CUSTOM ROLE PANEL: SELECTS ---
+    // --- SELECT MENUS ---
     if (interaction.isStringSelectMenu()) {
-        // Verwijderen
         if (interaction.customId === 'cr_select_remove') {
-            if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+            if (!isCustomRoleManager(interaction.user.id)) {
                 return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
             }
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -1502,7 +1536,6 @@ client.on('interactionCreate', async (interaction) => {
                 const role = guild.roles.cache.get(roleId);
                 if (role) await role.delete('Custom role verwijderd').catch(() => {});
                 customRoles.splice(idx, 1);
-                // Volgorde herberekenen
                 customRoles.forEach((c, i) => c.order = i);
                 await saveToGist();
                 await updateCustomRolePanel();
@@ -1515,9 +1548,8 @@ client.on('interactionCreate', async (interaction) => {
             return;
         }
 
-        // Hernoemen
         if (interaction.customId === 'cr_select_rename') {
-            if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+            if (!isCustomRoleManager(interaction.user.id)) {
                 return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
             }
             const roleId = interaction.values[0];
@@ -1539,9 +1571,8 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.showModal(modal);
         }
 
-        // Omhoog / omlaag
         if (interaction.customId === 'cr_select_move') {
-            if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+            if (!isCustomRoleManager(interaction.user.id)) {
                 return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
             }
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
@@ -1567,11 +1598,12 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
-    // --- CUSTOM ROLE PANEL: BUTTONS ---
+    // --- BUTTONS ---
     if (!interaction.isButton()) return;
 
+    // Custom role panel knoppen
     if (interaction.customId === 'cr_add') {
-        if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+        if (!isCustomRoleManager(interaction.user.id)) {
             return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
         }
         const modal = new ModalBuilder()
@@ -1589,7 +1621,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.customId === 'cr_remove') {
-        if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+        if (!isCustomRoleManager(interaction.user.id)) {
             return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
         }
         if (customRoles.length === 0) {
@@ -1607,7 +1639,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.customId === 'cr_rename') {
-        if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+        if (!isCustomRoleManager(interaction.user.id)) {
             return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
         }
         if (customRoles.length === 0) {
@@ -1625,7 +1657,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.customId === 'cr_up' || interaction.customId === 'cr_down') {
-        if (!CONFIG.CUSTOM_ROLE_MANAGERS.includes(interaction.user.id)) {
+        if (!isCustomRoleManager(interaction.user.id)) {
             return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
         }
         if (customRoles.length < 2) {
