@@ -218,7 +218,6 @@ const actionTracker = new Map();
 const activeCalls = new Map();
 const callAllowed = new Map();
 const roleCountCache = new Map();
-// Bewaart het originele ephemeral bericht per kanaal voor updates
 const callInfoMessages = new Map();
 
 // --- HELPERS ---
@@ -412,7 +411,8 @@ function buildCallPanel() {
         .setDescription(
             'Maak een call aan met de knop hieronder.\n\n' +
             '**Openbaar** — iedereen met verify kan joinen.\n' +
-            '**Privé** — alleen jij kan mensen toelaten.'
+            '**Privé** — alleen jij kan mensen toelaten.\n\n' +
+            '**Kantoor** — stuur je eigen call-paneel opnieuw om mensen toe te voegen of te verwijderen.'
         )
         .setColor('#5865f2')
         .setThumbnail(CONFIG.LOGO_URL);
@@ -427,7 +427,12 @@ function buildCallPanel() {
             .setCustomId('call_open_private')
             .setLabel('Privé')
             .setEmoji('🔒')
-            .setStyle(ButtonStyle.Danger)
+            .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+            .setCustomId('call_office_panel')
+            .setLabel('Kantoor')
+            .setEmoji('📋')
+            .setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [row] };
@@ -447,7 +452,6 @@ async function setupCallCategory(guild) {
     }
 }
 
-// Bouwt de ephemeral info: toegangslijst + knoppen
 function buildCallInfoMessage(channelId, ownerId, isPrivate) {
     const allowed = callAllowed.get(channelId) || new Set();
 
@@ -492,7 +496,6 @@ function buildCallInfoMessage(channelId, ownerId, isPrivate) {
         );
     }
 
-    // Verberg-knop voor het ephemeral bericht
     rows.push(
         new ActionRowBuilder().addComponents(
             new ButtonBuilder()
@@ -511,7 +514,6 @@ function buildCallInfoMessage(channelId, ownerId, isPrivate) {
     return { embeds: [embed], components: rows };
 }
 
-// Bouwt het permanente bericht in het call-kanaal (zichtbaar voor eigenaar)
 function buildCallControlMessage(channelId, ownerId, isPrivate) {
     const embed = new EmbedBuilder()
         .setTitle(isPrivate ? '🔒 Privé call' : '🔊 Openbare call')
@@ -557,21 +559,21 @@ function buildCallControlMessage(channelId, ownerId, isPrivate) {
     return { embeds: [embed], components: rows };
 }
 
-// Werkt de ephemeral info bij. Probeert eerst de originele reply te editen,
-// anders stuurt het een nieuwe ephemeral.
-async function updateCallInfo(interaction, channelId, ownerId, isPrivate) {
-    const payload = buildCallInfoMessage(channelId, ownerId, isPrivate);
+async function updateCallControlMessage(channelId, ownerId, isPrivate) {
     try {
-        if (interaction.deferred || interaction.replied) {
-            await interaction.editReply(payload).catch(() => {});
-        } else {
-            await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
-        }
+        const channel = await client.channels.fetch(channelId).catch(() => null);
+        if (!channel) return;
+
+        const controlId = callInfoMessages.get(channelId);
+        if (!controlId) return;
+
+        const msg = await channel.messages.fetch(controlId).catch(() => null);
+        if (!msg) return;
+
+        const payload = buildCallControlMessage(channelId, ownerId, isPrivate);
+        await msg.edit(payload).catch(() => {});
     } catch (err) {
-        // fallback: nieuwe ephemeral
-        try {
-            await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
-        } catch (e) {}
+        console.error('Fout bij updaten call control message:', err);
     }
 }
 
@@ -624,13 +626,11 @@ async function createCall(interaction, name, isPrivate) {
     });
     callAllowed.set(channel.id, new Set([member.id]));
 
-    // Stuur het permanente controlebericht in het call-kanaal
     const controlMsg = await channel.send(buildCallControlMessage(channel.id, member.id, isPrivate)).catch(() => null);
     if (controlMsg) {
         callInfoMessages.set(channel.id, controlMsg.id);
     }
 
-    // Ephemeral info voor de eigenaar in het aanmaakkanaal
     const payload = buildCallInfoMessage(channel.id, member.id, isPrivate);
     await interaction.editReply(payload).catch(() => {});
 
@@ -1099,7 +1099,6 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
-    // Modal submit: defer eerst
     if (interaction.isModalSubmit()) {
         if (interaction.customId === 'call_modal_public' || interaction.customId === 'call_modal_private') {
             const isPrivate = interaction.customId === 'call_modal_private';
@@ -1137,12 +1136,10 @@ client.on('interactionCreate', async (interaction) => {
                 if (!callAllowed.has(channelId)) callAllowed.set(channelId, new Set());
                 callAllowed.get(channelId).add(userId);
 
-                // Update het permanente bericht in de call
                 await updateCallControlMessage(channelId, call.ownerId, call.isPrivate);
 
                 await interaction.reply({ content: `<@${userId}> is toegelaten tot de call.`, flags: MessageFlags.Ephemeral });
 
-                // Nieuwe ephemeral met bijgewerkte lijst
                 try {
                     const payload = buildCallInfoMessage(channelId, call.ownerId, call.isPrivate);
                     await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
@@ -1226,6 +1223,35 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.showModal(modal);
     }
 
+    // Kantoor-knop: stuur het paneel opnieuw voor de calls waar jij eigenaar van bent
+    if (interaction.customId === 'call_office_panel') {
+        const myCalls = [];
+        for (const [channelId, call] of activeCalls.entries()) {
+            if (call.ownerId === interaction.user.id) {
+                myCalls.push({ channelId, ...call });
+            }
+        }
+
+        if (myCalls.length === 0) {
+            return interaction.reply({
+                content: 'Je hebt momenteel geen actieve call. Maak eerst een call aan met **Openbaar** of **Privé**.',
+                flags: MessageFlags.Ephemeral
+            });
+        }
+
+        // Stuur voor elke eigen call een ephemeral paneel
+        for (let i = 0; i < myCalls.length; i++) {
+            const c = myCalls[i];
+            const payload = buildCallInfoMessage(c.channelId, c.ownerId, c.isPrivate);
+            if (i === 0) {
+                await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+            } else {
+                await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
+            }
+        }
+        return;
+    }
+
     if (interaction.customId.startsWith('call_allow_') && !interaction.customId.startsWith('call_allow_select_')) {
         const channelId = interaction.customId.replace('call_allow_', '');
         const call = activeCalls.get(channelId);
@@ -1268,7 +1294,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (interaction.customId.startsWith('call_hide_')) {
         try {
-            await interaction.update({ content: '🙈 Bericht verborgen. Je kan de knoppen in het call-kanaal gebruiken.', embeds: [], components: [] });
+            await interaction.update({ content: '🙈 Bericht verborgen. Je kan de knoppen in het call-kanaal gebruiken, of via **Kantoor** opnieuw openen.', embeds: [], components: [] });
         } catch (err) {}
         return;
     }
@@ -1362,25 +1388,6 @@ client.on('interactionCreate', async (interaction) => {
         }
     }
 });
-
-// Werkt het permanente controlebericht in het call-kanaal bij
-async function updateCallControlMessage(channelId, ownerId, isPrivate) {
-    try {
-        const channel = await client.channels.fetch(channelId).catch(() => null);
-        if (!channel) return;
-
-        const controlId = callInfoMessages.get(channelId);
-        if (!controlId) return;
-
-        const msg = await channel.messages.fetch(controlId).catch(() => null);
-        if (!msg) return;
-
-        const payload = buildCallControlMessage(channelId, ownerId, isPrivate);
-        await msg.edit(payload).catch(() => {});
-    } catch (err) {
-        console.error('Fout bij updaten call control message:', err);
-    }
-}
 
 client.on('error', (err) => {
     console.error('Client error:', err);
