@@ -46,10 +46,15 @@ const CONFIG = {
     SNAP_BUTTON_ID: 'snap_ping_click',
 
     HONEYPOT_CHANNEL_ID: '1567295355740229733',
-    LOG_CHANNEL_ID: '1567299300436746310',
 
     CALL_CHANNEL_ID: '1567542253633933402',
     CALL_CATEGORY_ID: '1567297941146829040',
+
+    // Log kanalen
+    VERIFY_LOG_ID: '1567547632211988640',
+    SNAP_LOG_ID: '1567547761912578141',
+    CALL_LOG_ID: '1567547888119058562',
+    JOIN_LEAVE_LOG_ID: '1567549266635788370',
 
     EMPTY_CALL_TIMEOUT_MS: 60 * 60 * 1000,
     EMPTY_CALL_CHECK_MS: 5 * 60 * 1000,
@@ -73,6 +78,7 @@ const GIST_FILE = 'zoet.json';
 let gistId = CONFIG.GIST_ID;
 let kickData = { total: 0 };
 let antinukeData = { enabled: true };
+let joinTimes = {}; // userId -> timestamp (voor verblijfsduur)
 let gistReady = false;
 
 async function gistRequest(method, endpoint, body) {
@@ -111,7 +117,11 @@ async function initGist() {
                 public: false,
                 files: {
                     [GIST_FILE]: {
-                        content: JSON.stringify({ kicks: { total: 0 }, antinuke: { enabled: true } }, null, 2)
+                        content: JSON.stringify({
+                            kicks: { total: 0 },
+                            antinuke: { enabled: true },
+                            joinTimes: {}
+                        }, null, 2)
                     }
                 }
             });
@@ -137,8 +147,9 @@ async function loadFromGist() {
             const data = JSON.parse(file.content);
             if (data.kicks) kickData = data.kicks;
             if (data.antinuke) antinukeData = data.antinuke;
+            if (data.joinTimes) joinTimes = data.joinTimes;
         }
-        console.log(`Database geladen: kicks=${kickData.total}, antinuke=${antinukeData.enabled}`);
+        console.log(`Database geladen: kicks=${kickData.total}, antinuke=${antinukeData.enabled}, joinTimes=${Object.keys(joinTimes).length}`);
     } catch (err) {
         console.error('Fout bij laden database:', err.message);
     }
@@ -150,7 +161,11 @@ async function saveToGist() {
         await gistRequest('PATCH', `/gists/${gistId}`, {
             files: {
                 [GIST_FILE]: {
-                    content: JSON.stringify({ kicks: kickData, antinuke: antinukeData }, null, 2)
+                    content: JSON.stringify({
+                        kicks: kickData,
+                        antinuke: antinukeData,
+                        joinTimes
+                    }, null, 2)
                 }
             }
         });
@@ -171,6 +186,21 @@ const FONT_MAP = {
 };
 function toFont(text) {
     return text.split('').map(ch => FONT_MAP[ch] || ch).join('');
+}
+
+// --- TIJD HELPER ---
+function formatDuration(ms) {
+    const sec = Math.floor(ms / 1000);
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const parts = [];
+    if (d > 0) parts.push(`${d}d`);
+    if (h > 0) parts.push(`${h}u`);
+    if (m > 0) parts.push(`${m}m`);
+    if (parts.length === 0 || s > 0) parts.push(`${s}s`);
+    return parts.join(' ');
 }
 
 const client = new Client({
@@ -264,9 +294,10 @@ async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
     }
 }
 
-async function sendLog(guild, { title, description, color, thumbnail }) {
+// Stuurt een log naar een specifiek kanaal
+async function sendLog(guild, channelId, { title, description, color, thumbnail }) {
     try {
-        const channel = guild.channels.cache.get(CONFIG.LOG_CHANNEL_ID);
+        const channel = guild.channels.cache.get(channelId);
         if (!channel) return;
         const embed = new EmbedBuilder()
             .setTitle(title)
@@ -345,7 +376,7 @@ async function punishUser(guild, userId, reason) {
             await member.roles.remove(removable, `Anti-nuke: ${reason}`).catch(() => {});
         }
         await member.kick(`Anti-nuke: ${reason}`).catch(() => {});
-        await sendLog(guild, {
+        await sendLog(guild, CONFIG.JOIN_LEAVE_LOG_ID, {
             title: '🚨 Anti-nuke actie',
             description: `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n**Reden:** ${reason}`,
             color: '#e74c3c',
@@ -409,34 +440,62 @@ async function setupCallCategory(guild) {
     }
 }
 
-// Info-bericht in een call-kanaal. Alleen bij privé een "Iemand toelaten"-knop.
 function buildCallInfoMessage(channelId, ownerId, isPrivate) {
+    const call = activeCalls.get(channelId);
+    const allowed = callAllowed.get(channelId) || new Set();
+
+    let allowedList = '_Niemand anders heeft toegang._';
+    if (allowed.size > 1) {
+        allowedList = Array.from(allowed)
+            .filter(id => id !== ownerId)
+            .map(id => `<@${id}>`)
+            .join('\n');
+    }
+
     const embed = new EmbedBuilder()
-        .setTitle(isPrivate ? '🔒 Privé call' : '🔊 Openbare call')
+        .setTitle(isPrivate ? '🔒 Privé call aangemaakt' : '🔊 Openbare call aangemaakt')
         .setDescription(
             `**Eigenaar:** <@${ownerId}>\n` +
-            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n\n` +
+            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n` +
+            `**Kanaal:** <#${channelId}>\n\n` +
+            `**Toegang:**\n${allowedList}\n\n` +
             (isPrivate
-                ? 'Deze call is privé. Alleen de eigenaar kan mensen toelaten via de knop hieronder.'
-                : 'Deze call is openbaar. Iedereen met verify kan joinen.')
+                ? 'Alleen jij kan mensen toelaten of verwijderen.'
+                : 'Iedereen met verify kan joinen.')
         )
         .setColor(isPrivate ? '#e74c3c' : '#2ecc71')
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
 
-    const components = [];
+    const rows = [];
+
     if (isPrivate) {
-        components.push(
+        rows.push(
             new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId(`call_allow_${channelId}`)
                     .setLabel('Iemand toelaten')
                     .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success)
+                    .setStyle(ButtonStyle.Success),
+                new ButtonBuilder()
+                    .setCustomId(`call_remove_${channelId}`)
+                    .setLabel('Iemand verwijderen')
+                    .setEmoji('➖')
+                    .setStyle(ButtonStyle.Secondary)
             )
         );
     }
 
-    return { content: `<@${ownerId}>`, embeds: [embed], components };
+    rows.push(
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(`call_delete_${channelId}`)
+                .setLabel('Verwijder call')
+                .setEmoji('🗑️')
+                .setStyle(ButtonStyle.Danger)
+        )
+    );
+
+    return { embeds: [embed], components: rows };
 }
 
 async function createCall(interaction, name, isPrivate) {
@@ -488,14 +547,10 @@ async function createCall(interaction, name, isPrivate) {
     });
     callAllowed.set(channel.id, new Set([member.id]));
 
-    await channel.send(buildCallInfoMessage(channel.id, member.id, isPrivate)).catch(() => {});
+    const payload = await buildCallInfoMessage(channel.id, member.id, isPrivate);
+    await interaction.editReply(payload);
 
-    await interaction.reply({
-        content: `Je call is aangemaakt: <#${channel.id}>`,
-        flags: MessageFlags.Ephemeral
-    });
-
-    await sendLog(guild, {
+    await sendLog(guild, CONFIG.CALL_LOG_ID, {
         title: isPrivate ? '🔒 Privé call gemaakt' : '🔊 Openbare call gemaakt',
         description: `**Eigenaar:** ${member.user.tag} (\`${member.id}\`)\n**Kanaal:** <#${channel.id}>`,
         color: isPrivate ? '#e74c3c' : '#2ecc71',
@@ -622,9 +677,13 @@ client.once('clientReady', async () => {
     console.log(`Lege-call checker gestart (elke ${CONFIG.EMPTY_CALL_CHECK_MS / 60000} min, timeout ${CONFIG.EMPTY_CALL_TIMEOUT_MS / 60000} min)`);
 });
 
-// --- WELCOME + DM ---
+// --- WELCOME + DM + JOIN LOG ---
 client.on('guildMemberAdd', async (member) => {
     updateStatus(member.guild);
+
+    // Sla join-tijd op voor verblijfsduur
+    joinTimes[member.id] = Date.now();
+    await saveToGist();
 
     try {
         const channel = member.guild.channels.cache.get(CONFIG.WELCOME_CHANNEL_ID);
@@ -656,17 +715,49 @@ client.on('guildMemberAdd', async (member) => {
             .setThumbnail(CONFIG.LOGO_URL);
         await member.send({ embeds: [dmEmbed] });
     } catch (err) {}
+
+    // Join log
+    await sendLog(member.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
+        title: '📥 Lid gejoint',
+        description:
+            `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n` +
+            `**Account aangemaakt:** <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>\n` +
+            `**Leden nu:** ${member.guild.memberCount}`,
+        color: '#2ecc71',
+        thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
+    });
 });
 
+// --- LEAVE LOG met verblijfsduur + verify/snap logs ---
 client.on('guildMemberRemove', async (member) => {
     updateStatus(member.guild);
+
+    const joinedAt = joinTimes[member.id];
+    let durationText = 'Onbekend';
+    if (joinedAt) {
+        durationText = formatDuration(Date.now() - joinedAt);
+        delete joinTimes[member.id];
+        await saveToGist();
+    }
 
     const hadVerify = member.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
     const hadSnap = member.roles.cache.has(CONFIG.SNAP_ROLE_ID);
 
+    // Leave log
+    await sendLog(member.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
+        title: '📤 Lid verlaten',
+        description:
+            `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n` +
+            `**In server voor:** ${durationText}\n` +
+            `**Had verify:** ${hadVerify ? 'ja' : 'nee'}\n` +
+            `**Had snapchat ping:** ${hadSnap ? 'ja' : 'nee'}`,
+        color: '#e74c3c',
+        thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
+    });
+
     if (hadVerify) {
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
-        await sendLog(member.guild, {
+        await sendLog(member.guild, CONFIG.VERIFY_LOG_ID, {
             title: '❌ Verify verlaten',
             description: `${member.user.tag} (\`${member.id}\`) heeft de server verlaten en had de verify rol.`,
             color: '#e74c3c',
@@ -676,7 +767,7 @@ client.on('guildMemberRemove', async (member) => {
 
     if (hadSnap) {
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
-        await sendLog(member.guild, {
+        await sendLog(member.guild, CONFIG.SNAP_LOG_ID, {
             title: '❌ Snapchat Ping verlaten',
             description: `${member.user.tag} (\`${member.id}\`) heeft de server verlaten en had de Snapchat Ping rol.`,
             color: '#e74c3c',
@@ -695,7 +786,7 @@ client.on('guildMemberRemove', async (member) => {
     }
 });
 
-// --- ROLLEN + DM NA VERIFY ---
+// --- ROLLEN + DM NA VERIFY + aparte logs ---
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const oldVerify = oldMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
     const newVerify = newMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
@@ -704,7 +795,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
     if (!oldVerify && newVerify) {
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
-        await sendLog(newMember.guild, {
+        await sendLog(newMember.guild, CONFIG.VERIFY_LOG_ID, {
             title: '✅ Verify gekregen',
             description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de verify rol gekregen.`,
             color: '#2ecc71',
@@ -723,7 +814,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
         } catch (err) {}
     } else if (oldVerify && !newVerify) {
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
-        await sendLog(newMember.guild, {
+        await sendLog(newMember.guild, CONFIG.VERIFY_LOG_ID, {
             title: '❌ Verify verwijderd',
             description: `${newMember.user.tag} (\`${newMember.id}\`) is niet meer geverifieerd.`,
             color: '#e74c3c',
@@ -733,7 +824,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
     if (!oldSnap && newSnap) {
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
-        await sendLog(newMember.guild, {
+        await sendLog(newMember.guild, CONFIG.SNAP_LOG_ID, {
             title: '👻 Snapchat Ping gekregen',
             description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de Snapchat Ping rol gekregen.`,
             color: '#f7c948',
@@ -741,7 +832,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
         });
     } else if (oldSnap && !newSnap) {
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
-        await sendLog(newMember.guild, {
+        await sendLog(newMember.guild, CONFIG.SNAP_LOG_ID, {
             title: '❌ Snapchat Ping verwijderd',
             description: `${newMember.user.tag} (\`${newMember.id}\`) heeft de Snapchat Ping rol niet meer.`,
             color: '#e74c3c',
@@ -893,7 +984,7 @@ client.on('interactionCreate', async (interaction) => {
                 }
                 antinukeData.enabled = true;
                 await saveToGist();
-                await sendLog(interaction.guild, {
+                await sendLog(interaction.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
                     title: '🛡️ Anti-nuke ingeschakeld',
                     description: `Ingeschakeld door ${interaction.user.tag}.`,
                     color: '#2ecc71'
@@ -906,7 +997,7 @@ client.on('interactionCreate', async (interaction) => {
                 }
                 antinukeData.enabled = false;
                 await saveToGist();
-                await sendLog(interaction.guild, {
+                await sendLog(interaction.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
                     title: '🛡️ Anti-nuke uitgeschakeld',
                     description: `Uitgeschakeld door ${interaction.user.tag}.`,
                     color: '#e74c3c'
@@ -951,9 +1042,55 @@ client.on('interactionCreate', async (interaction) => {
                 if (!callAllowed.has(channelId)) callAllowed.set(channelId, new Set());
                 callAllowed.get(channelId).add(userId);
                 await interaction.reply({ content: `<@${userId}> is toegelaten tot de call.`, flags: MessageFlags.Ephemeral });
+
+                await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
+                    title: '✅ Toegelaten tot call',
+                    description: `**Eigenaar:** <@${call.ownerId}>\n**Toegelaten:** <@${userId}>\n**Call:** <#${channelId}>`,
+                    color: '#2ecc71'
+                });
             } catch (err) {
                 console.error('Fout bij toelaten user:', err);
                 await interaction.reply({ content: 'Kon de gebruiker niet toelaten.', flags: MessageFlags.Ephemeral }).catch(() => {});
+            }
+        }
+
+        if (interaction.customId.startsWith('call_remove_select_')) {
+            const channelId = interaction.customId.replace('call_remove_select_', '');
+            const call = activeCalls.get(channelId);
+            if (!call) {
+                return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
+            }
+            if (interaction.user.id !== call.ownerId) {
+                return interaction.reply({ content: 'Alleen de eigenaar kan mensen verwijderen.', flags: MessageFlags.Ephemeral });
+            }
+
+            const userId = interaction.values[0];
+            if (userId === call.ownerId) {
+                return interaction.reply({ content: 'Je kan jezelf niet verwijderen.', flags: MessageFlags.Ephemeral });
+            }
+
+            try {
+                const channel = await client.channels.fetch(channelId);
+                await channel.permissionOverwrites.delete(userId).catch(() => {});
+                const allowed = callAllowed.get(channelId);
+                if (allowed) allowed.delete(userId);
+
+                // Verplaats de user uit de call indien die erin zit
+                const voiceMember = channel.members.get(userId);
+                if (voiceMember) {
+                    await voiceMember.voice.disconnect('Verwijderd uit call door eigenaar').catch(() => {});
+                }
+
+                await interaction.reply({ content: `<@${userId}> is verwijderd uit de call.`, flags: MessageFlags.Ephemeral });
+
+                await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
+                    title: '➖ Verwijderd uit call',
+                    description: `**Eigenaar:** <@${call.ownerId}>\n**Verwijderd:** <@${userId}>\n**Call:** <#${channelId}>`,
+                    color: '#e74c3c'
+                });
+            } catch (err) {
+                console.error('Fout bij verwijderen user uit call:', err);
+                await interaction.reply({ content: 'Kon de gebruiker niet verwijderen.', flags: MessageFlags.Ephemeral }).catch(() => {});
             }
         }
         return;
@@ -978,7 +1115,6 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.showModal(modal);
     }
 
-    // Iemand toelaten-knop in het call-kanaal
     if (interaction.customId.startsWith('call_allow_') && !interaction.customId.startsWith('call_allow_select_')) {
         const channelId = interaction.customId.replace('call_allow_', '');
         const call = activeCalls.get(channelId);
@@ -997,6 +1133,57 @@ client.on('interactionCreate', async (interaction) => {
                 .setMaxValues(1)
         );
         return interaction.reply({ content: 'Kies een lid om toe te laten:', components: [selectRow], flags: MessageFlags.Ephemeral });
+    }
+
+    if (interaction.customId.startsWith('call_remove_') && !interaction.customId.startsWith('call_remove_select_')) {
+        const channelId = interaction.customId.replace('call_remove_', '');
+        const call = activeCalls.get(channelId);
+        if (!call) {
+            return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
+        }
+        if (interaction.user.id !== call.ownerId) {
+            return interaction.reply({ content: 'Alleen de eigenaar kan mensen verwijderen.', flags: MessageFlags.Ephemeral });
+        }
+
+        const selectRow = new ActionRowBuilder().addComponents(
+            new UserSelectMenuBuilder()
+                .setCustomId(`call_remove_select_${channelId}`)
+                .setPlaceholder('Kies een lid om te verwijderen')
+                .setMinValues(1)
+                .setMaxValues(1)
+        );
+        return interaction.reply({ content: 'Kies een lid om te verwijderen:', components: [selectRow], flags: MessageFlags.Ephemeral });
+    }
+
+    if (interaction.customId.startsWith('call_delete_')) {
+        const channelId = interaction.customId.replace('call_delete_', '');
+        const call = activeCalls.get(channelId);
+        if (!call) {
+            return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
+        }
+        if (interaction.user.id !== call.ownerId) {
+            return interaction.reply({ content: 'Alleen de eigenaar kan de call verwijderen.', flags: MessageFlags.Ephemeral });
+        }
+
+        try {
+            const channel = await client.channels.fetch(channelId).catch(() => null);
+            if (channel) await channel.delete('Eigenaar heeft de call verwijderd').catch(() => {});
+        } catch (err) {
+            console.error('Fout bij verwijderen call:', err);
+        }
+        activeCalls.delete(channelId);
+        callAllowed.delete(channelId);
+
+        try {
+            await interaction.update({ content: '🗑️ Call verwijderd.', embeds: [], components: [] });
+        } catch (err) {}
+
+        await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
+            title: '🗑️ Call verwijderd',
+            description: `**Eigenaar:** <@${call.ownerId}>\n**Kanaal:** <#${channelId}>`,
+            color: '#e74c3c'
+        });
+        return;
     }
 
     if (interaction.customId === CONFIG.VERIFY_BUTTON_ID) {
