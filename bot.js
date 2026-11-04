@@ -15,7 +15,8 @@ const {
     ChannelType,
     ModalBuilder,
     TextInputBuilder,
-    TextInputStyle
+    TextInputStyle,
+    UserSelectMenuBuilder
 } = require('discord.js');
 
 // --- KLEINE HTTP SERVER ZODAT RENDER EEN POORT ZIET ---
@@ -50,6 +51,11 @@ const CONFIG = {
     CALL_CHANNEL_ID: '1567542253633933402',
     CALL_CATEGORY_ID: '1567297941146829040',
 
+    // Na hoeveel ms een lege call verwijderd wordt (1 uur)
+    EMPTY_CALL_TIMEOUT_MS: 60 * 60 * 1000,
+    // Hoe vaak we checken (elke 5 minuten)
+    EMPTY_CALL_CHECK_MS: 5 * 60 * 1000,
+
     ANTINUKE_ALLOWED_USERS: [
         '1033753872927293520',
         '1559586201348866050'
@@ -65,7 +71,7 @@ const CONFIG = {
 };
 
 // --- GIST DATABASE ---
-const GIST_FILES = { KICKS: 'kicks.json', ANTINUKE: 'antinuke.json' };
+const GIST_FILE = 'zoet.json';
 let gistId = CONFIG.GIST_ID;
 let kickData = { total: 0 };
 let antinukeData = { enabled: true };
@@ -106,8 +112,9 @@ async function initGist() {
                 description: 'Familie Zoet bot database',
                 public: false,
                 files: {
-                    [GIST_FILES.KICKS]: { content: JSON.stringify({ total: 0 }) },
-                    [GIST_FILES.ANTINUKE]: { content: JSON.stringify({ enabled: true }) }
+                    [GIST_FILE]: {
+                        content: JSON.stringify({ kicks: { total: 0 }, antinuke: { enabled: true } }, null, 2)
+                    }
                 }
             });
             gistId = gist.id;
@@ -127,11 +134,11 @@ async function loadFromGist() {
     if (!gistReady || !gistId) return;
     try {
         const gist = await gistRequest('GET', `/gists/${gistId}`);
-        if (gist.files[GIST_FILES.KICKS]?.content) {
-            kickData = JSON.parse(gist.files[GIST_FILES.KICKS].content);
-        }
-        if (gist.files[GIST_FILES.ANTINUKE]?.content) {
-            antinukeData = JSON.parse(gist.files[GIST_FILES.ANTINUKE].content);
+        const file = gist.files[GIST_FILE];
+        if (file?.content) {
+            const data = JSON.parse(file.content);
+            if (data.kicks) kickData = data.kicks;
+            if (data.antinuke) antinukeData = data.antinuke;
         }
         console.log(`Database geladen: kicks=${kickData.total}, antinuke=${antinukeData.enabled}`);
     } catch (err) {
@@ -144,8 +151,9 @@ async function saveToGist() {
     try {
         await gistRequest('PATCH', `/gists/${gistId}`, {
             files: {
-                [GIST_FILES.KICKS]: { content: JSON.stringify(kickData) },
-                [GIST_FILES.ANTINUKE]: { content: JSON.stringify(antinukeData) }
+                [GIST_FILE]: {
+                    content: JSON.stringify({ kicks: kickData, antinuke: antinukeData }, null, 2)
+                }
             }
         });
     } catch (err) {
@@ -181,8 +189,12 @@ const client = new Client({
 });
 
 const actionTracker = new Map();
+// Actieve calls: channelId -> { ownerId, isPrivate, guildId, emptySince }
 const activeCalls = new Map();
+// Toegelaten users per call
 const callAllowed = new Map();
+// Openstaande verzoeken: requestId -> { channelId, ownerId, userId, expiresAt }
+const pendingRequests = new Map();
 
 // --- HELPERS ---
 async function countRoleMembers(guild, roleId) {
@@ -368,7 +380,8 @@ function buildCallPanel() {
         .setDescription(
             'Maak een call aan met de knop hieronder.\n\n' +
             '**Openbaar** — iedereen met verify kan joinen.\n' +
-            '**Privé** — alleen jij kan mensen toelaten.'
+            '**Privé** — alleen jij kan mensen toelaten.\n\n' +
+            '💼 **Kantoor** — klik op Kantoor in een call om toegang te vragen.'
         )
         .setColor('#5865f2')
         .setThumbnail(CONFIG.LOGO_URL);
@@ -401,6 +414,41 @@ async function setupCallCategory(guild) {
     } catch (err) {
         console.error('Fout bij instellen call categorie:', err);
     }
+}
+
+// Bouwt het info-bericht in een call-kanaal, inclusief Kantoor-knop
+function buildCallInfoMessage(channelId, ownerId, isPrivate) {
+    const embed = new EmbedBuilder()
+        .setTitle(isPrivate ? '🔒 Privé call' : '🔊 Openbare call')
+        .setDescription(
+            `**Eigenaar:** <@${ownerId}>\n` +
+            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n\n` +
+            (isPrivate
+                ? 'Deze call is privé. Alleen de eigenaar kan mensen toelaten via de knop hieronder.'
+                : 'Deze call is openbaar. Iedereen met verify kan joinen.')
+        )
+        .setColor(isPrivate ? '#e74c3c' : '#2ecc71')
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
+
+    const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`call_office_${channelId}`)
+            .setLabel('Kantoor')
+            .setEmoji('💼')
+            .setStyle(ButtonStyle.Secondary)
+    );
+
+    if (isPrivate) {
+        row.addComponents(
+            new ButtonBuilder()
+                .setCustomId(`call_allow_${channelId}`)
+                .setLabel('Iemand toelaten')
+                .setEmoji('✅')
+                .setStyle(ButtonStyle.Success)
+        );
+    }
+
+    return { content: `<@${ownerId}>`, embeds: [embed], components: [row] };
 }
 
 async function createCall(interaction, name, isPrivate) {
@@ -444,39 +492,15 @@ async function createCall(interaction, name, isPrivate) {
         reason: `Call van ${member.user.tag}`
     });
 
-    activeCalls.set(channel.id, { ownerId: member.id, isPrivate, guildId: guild.id });
+    activeCalls.set(channel.id, {
+        ownerId: member.id,
+        isPrivate,
+        guildId: guild.id,
+        emptySince: Date.now() // start als leeg tot iemand joint
+    });
     callAllowed.set(channel.id, new Set([member.id]));
 
-    const embed = new EmbedBuilder()
-        .setTitle(isPrivate ? '🔒 Privé call' : '🔊 Openbare call')
-        .setDescription(
-            `**Eigenaar:** ${member}\n` +
-            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n\n` +
-            (isPrivate
-                ? 'Deze call is privé. Alleen de eigenaar kan mensen toelaten via de knop hieronder.'
-                : 'Deze call is openbaar. Iedereen met verify kan joinen.')
-        )
-        .setColor(isPrivate ? '#e74c3c' : '#2ecc71')
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
-
-    const components = [];
-    if (isPrivate) {
-        components.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`call_allow_${channel.id}`)
-                    .setLabel('Iemand toelaten')
-                    .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success)
-            )
-        );
-    }
-
-    await channel.send({
-        content: `<@${member.id}>`,
-        embeds: [embed],
-        components
-    }).catch(() => {});
+    await channel.send(buildCallInfoMessage(channel.id, member.id, isPrivate)).catch(() => {});
 
     await interaction.reply({
         content: `Je call is aangemaakt: <#${channel.id}>`,
@@ -605,9 +629,13 @@ client.once('clientReady', async () => {
     } catch (err) {
         console.error('Fout bij call panel:', err);
     }
+
+    // Start de lege-call checker
+    setInterval(checkEmptyCalls, CONFIG.EMPTY_CALL_CHECK_MS);
+    console.log(`Lege-call checker gestart (elke ${CONFIG.EMPTY_CALL_CHECK_MS / 60000} min, timeout ${CONFIG.EMPTY_CALL_TIMEOUT_MS / 60000} min)`);
 });
 
-// --- WELCOME (kanaal + DM) ---
+// --- WELCOME + DM ---
 client.on('guildMemberAdd', async (member) => {
     updateStatus(member.guild);
 
@@ -629,7 +657,6 @@ client.on('guildMemberAdd', async (member) => {
         console.error('Fout bij welcome:', err);
     }
 
-    // DM bij join
     try {
         const dmEmbed = new EmbedBuilder()
             .setTitle(`Welkom bij ${CONFIG.SERVER_NAME}!`)
@@ -683,7 +710,7 @@ client.on('guildMemberRemove', async (member) => {
     }
 });
 
-// --- ROLLEN: ADD / REMOVE LOGS + DM NA VERIFY ---
+// --- ROLLEN + DM NA VERIFY ---
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const oldVerify = oldMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
     const newVerify = newMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
@@ -698,8 +725,6 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
             color: '#2ecc71',
             thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
-
-        // DM na verificatie
         try {
             const dmEmbed = new EmbedBuilder()
                 .setTitle(`Je bent geverifieerd!`)
@@ -710,9 +735,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
                 .setColor('#2ecc71')
                 .setThumbnail(CONFIG.LOGO_URL);
             await newMember.send({ embeds: [dmEmbed] });
-        } catch (err) {
-            // DM's staan soms uit
-        }
+        } catch (err) {}
     } else if (oldVerify && !newVerify) {
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
         await sendLog(newMember.guild, {
@@ -771,8 +794,6 @@ client.on('messageCreate', async (message) => {
         await member.kick('Honeypot kanaal - bericht geplaatst');
         kickData.total += 1;
         await saveToGist();
-
-        // Direct de waarschuwingsembed updaten
         await refreshHoneypotEmbed(message.channel);
 
         const embed = new EmbedBuilder()
@@ -790,27 +811,76 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-// --- CALL: eigenaar verlaat call -> kanaal verwijderen ---
+// --- CALL: voice state ---
 client.on('voiceStateUpdate', async (oldState, newState) => {
-    const channelId = oldState.channelId;
+    const channelId = oldState.channelId || newState.channelId;
     if (!channelId) return;
     if (!activeCalls.has(channelId)) return;
-    if (oldState.channelId === newState.channelId) return;
 
     const call = activeCalls.get(channelId);
     if (!call) return;
-    if (oldState.id !== call.ownerId) return;
 
-    try {
-        const channel = await client.channels.fetch(channelId).catch(() => null);
-        if (channel) await channel.delete('Call eigenaar heeft de call verlaten').catch(() => {});
-    } catch (err) {
-        console.error('Fout bij verwijderen call:', err);
+    const channel = newState.guild.channels.cache.get(channelId) || oldState.guild.channels.cache.get(channelId);
+    if (!channel) return;
+
+    // Eigenaar verlaat call -> kanaal verwijderen
+    if (oldState.channelId === channelId && newState.channelId !== channelId && oldState.id === call.ownerId) {
+        try {
+            await channel.delete('Call eigenaar heeft de call verlaten').catch(() => {});
+        } catch (err) {
+            console.error('Fout bij verwijderen call:', err);
+        }
+        activeCalls.delete(channelId);
+        callAllowed.delete(channelId);
+        return;
     }
 
-    activeCalls.delete(channelId);
-    callAllowed.delete(channelId);
+    // Houd bij of de call leeg is
+    const members = channel.members.filter(m => !m.user.bot);
+    if (members.size === 0) {
+        if (!call.emptySince) call.emptySince = Date.now();
+    } else {
+        call.emptySince = null;
+    }
+    activeCalls.set(channelId, call);
 });
+
+// Periodieke check voor lege calls
+async function checkEmptyCalls() {
+    const now = Date.now();
+    for (const [channelId, call] of activeCalls.entries()) {
+        try {
+            const channel = await client.channels.fetch(channelId).catch(() => null);
+            if (!channel) {
+                activeCalls.delete(channelId);
+                callAllowed.delete(channelId);
+                continue;
+            }
+
+            const members = channel.members.filter(m => !m.user.bot);
+            if (members.size > 0) {
+                call.emptySince = null;
+                activeCalls.set(channelId, call);
+                continue;
+            }
+
+            if (!call.emptySince) {
+                call.emptySince = now;
+                activeCalls.set(channelId, call);
+                continue;
+            }
+
+            if (now - call.emptySince >= CONFIG.EMPTY_CALL_TIMEOUT_MS) {
+                await channel.delete('Call was leeg voor 1 uur').catch(() => {});
+                activeCalls.delete(channelId);
+                callAllowed.delete(channelId);
+                console.log(`Lege call verwijderd: ${channelId}`);
+            }
+        } catch (err) {
+            console.error('Fout bij check lege call:', err);
+        }
+    }
+}
 
 // --- INTERACTIONS ---
 client.on('interactionCreate', async (interaction) => {
@@ -883,9 +953,36 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
+    // User select
+    if (interaction.isUserSelectMenu()) {
+        if (interaction.customId.startsWith('call_allow_select_')) {
+            const channelId = interaction.customId.replace('call_allow_select_', '');
+            const call = activeCalls.get(channelId);
+            if (!call) {
+                return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
+            }
+            if (interaction.user.id !== call.ownerId) {
+                return interaction.reply({ content: 'Alleen de eigenaar kan mensen toelaten.', flags: MessageFlags.Ephemeral });
+            }
+
+            const userId = interaction.values[0];
+            try {
+                const channel = await client.channels.fetch(channelId);
+                await channel.permissionOverwrites.edit(userId, { ViewChannel: true, Connect: true });
+                if (!callAllowed.has(channelId)) callAllowed.set(channelId, new Set());
+                callAllowed.get(channelId).add(userId);
+                await interaction.reply({ content: `<@${userId}> is toegelaten tot de call.`, flags: MessageFlags.Ephemeral });
+            } catch (err) {
+                console.error('Fout bij toelaten user:', err);
+                await interaction.reply({ content: 'Kon de gebruiker niet toelaten.', flags: MessageFlags.Ephemeral }).catch(() => {});
+            }
+        }
+        return;
+    }
+
     if (!interaction.isButton()) return;
 
-    // Call panel knoppen
+    // Call panel
     if (interaction.customId === 'call_open_public' || interaction.customId === 'call_open_private') {
         const isPrivate = interaction.customId === 'call_open_private';
         const modal = new ModalBuilder()
@@ -903,8 +1000,149 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.showModal(modal);
     }
 
-    // Iemand toelaten in privé call
-    if (interaction.customId.startsWith('call_allow_')) {
+    // Kantoor knop -> DM naar eigenaar
+    if (interaction.customId.startsWith('call_office_')) {
+        const channelId = interaction.customId.replace('call_office_', '');
+        const call = activeCalls.get(channelId);
+        if (!call) {
+            return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.user.id === call.ownerId) {
+            return interaction.reply({ content: 'Je bent zelf de eigenaar van deze call.', flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.user.id === client.user.id) return;
+
+        // Check of de user al toegelaten is
+        const allowed = callAllowed.get(channelId);
+        if (allowed && allowed.has(interaction.user.id)) {
+            return interaction.reply({ content: 'Je bent al toegelaten tot deze call.', flags: MessageFlags.Ephemeral });
+        }
+
+        const requestId = `${channelId}_${interaction.user.id}_${Date.now()}`;
+        const guild = interaction.guild;
+
+        try {
+            const owner = await client.users.fetch(call.ownerId);
+            const requestEmbed = new EmbedBuilder()
+                .setTitle('💼 Toegangsverzoek')
+                .setDescription(
+                    `**${interaction.user.tag}** wil graag toegang tot je call <#${channelId}>.\n\n` +
+                    `Wil je dat **${interaction.user.username}** in je call komt?`
+                )
+                .setColor('#5865f2')
+                .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 }))
+                .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
+
+            const row = new ActionRowBuilder().addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`call_req_accept_${requestId}`)
+                    .setLabel('Accept')
+                    .setEmoji('✅')
+                    .setStyle(ButtonStyle.Success),
+                new ButtonBuilder()
+                    .setCustomId(`call_req_deny_${requestId}`)
+                    .setLabel('Deny')
+                    .setEmoji('❌')
+                    .setStyle(ButtonStyle.Danger)
+            );
+
+            const dm = await owner.send({ embeds: [requestEmbed], components: [row] });
+            pendingRequests.set(requestId, {
+                channelId,
+                ownerId: call.ownerId,
+                userId: interaction.user.id,
+                guildId: guild.id,
+                messageId: dm.id,
+                expiresAt: Date.now() + 5 * 60 * 1000
+            });
+
+            // Automatisch opruimen na 5 minuten
+            setTimeout(async () => {
+                const req = pendingRequests.get(requestId);
+                if (!req) return;
+                pendingRequests.delete(requestId);
+                try {
+                    const msg = await owner.channels.cache.get(dm.channel.id)?.messages.fetch(dm.id).catch(() => null);
+                    if (msg) {
+                        await msg.edit({
+                            content: '⌛ Dit verzoek is verlopen.',
+                            embeds: [],
+                            components: []
+                        }).catch(() => {});
+                    }
+                } catch (err) {}
+            }, 5 * 60 * 1000);
+
+            await interaction.reply({ content: 'Je verzoek is verstuurd naar de eigenaar van de call.', flags: MessageFlags.Ephemeral });
+        } catch (err) {
+            console.error('Fout bij sturen verzoek:', err);
+            await interaction.reply({ content: 'Kon geen DM sturen naar de eigenaar. Mogelijk heeft die DM\'s uit staan.', flags: MessageFlags.Ephemeral }).catch(() => {});
+        }
+        return;
+    }
+
+    // Accept / Deny
+    if (interaction.customId.startsWith('call_req_accept_') || interaction.customId.startsWith('call_req_deny_')) {
+        const isAccept = interaction.customId.startsWith('call_req_accept_');
+        const requestId = interaction.customId.replace('call_req_accept_', '').replace('call_req_deny_', '');
+        const req = pendingRequests.get(requestId);
+
+        if (!req) {
+            return interaction.reply({ content: 'Dit verzoek is verlopen.', flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.user.id !== req.ownerId) {
+            return interaction.reply({ content: 'Alleen de eigenaar kan dit verzoek behandelen.', flags: MessageFlags.Ephemeral });
+        }
+
+        pendingRequests.delete(requestId);
+
+        if (isAccept) {
+            try {
+                const channel = await client.channels.fetch(req.channelId).catch(() => null);
+                if (channel) {
+                    await channel.permissionOverwrites.edit(req.userId, { ViewChannel: true, Connect: true });
+                }
+                if (!callAllowed.has(req.channelId)) callAllowed.set(req.channelId, new Set());
+                callAllowed.get(req.channelId).add(req.userId);
+
+                await interaction.update({
+                    content: `✅ Je hebt **<@${req.userId}>** toegelaten tot de call.`,
+                    embeds: [],
+                    components: []
+                });
+
+                // Laat de aanvrager weten
+                try {
+                    const user = await client.users.fetch(req.userId);
+                    await user.send(`✅ Je verzoek is geaccepteerd! Je kan nu joinen: <#${req.channelId}>`);
+                } catch (err) {}
+            } catch (err) {
+                console.error('Fout bij accepteren verzoek:', err);
+                await interaction.update({ content: '❌ Er ging iets mis bij het toelaten.', embeds: [], components: [] }).catch(() => {});
+            }
+        } else {
+            try {
+                await interaction.update({
+                    content: `❌ Je hebt **<@${req.userId}>** geweigerd voor de call.`,
+                    embeds: [],
+                    components: []
+                });
+                try {
+                    const user = await client.users.fetch(req.userId);
+                    await user.send(`❌ Je verzoek voor de call is geweigerd.`);
+                } catch (err) {}
+            } catch (err) {
+                console.error('Fout bij weigeren verzoek:', err);
+            }
+        }
+        return;
+    }
+
+    // Iemand toelaten (directe knop in privé call)
+    if (interaction.customId.startsWith('call_allow_') && !interaction.customId.startsWith('call_allow_select_')) {
         const channelId = interaction.customId.replace('call_allow_', '');
         const call = activeCalls.get(channelId);
         if (!call) {
@@ -915,7 +1153,7 @@ client.on('interactionCreate', async (interaction) => {
         }
 
         const selectRow = new ActionRowBuilder().addComponents(
-            new (require('discord.js').UserSelectMenuBuilder)()
+            new UserSelectMenuBuilder()
                 .setCustomId(`call_allow_select_${channelId}`)
                 .setPlaceholder('Kies een lid om toe te laten')
                 .setMinValues(1)
@@ -981,36 +1219,6 @@ client.on('interactionCreate', async (interaction) => {
                 await interaction.reply({ content: 'Er ging iets mis.', flags: MessageFlags.Ephemeral }).catch(() => {});
             }
         }
-    }
-});
-
-// User select voor call toelaten
-client.on('interactionCreate', async (interaction) => {
-    if (!interaction.isUserSelectMenu()) return;
-    if (!interaction.customId.startsWith('call_allow_select_')) return;
-
-    const channelId = interaction.customId.replace('call_allow_select_', '');
-    const call = activeCalls.get(channelId);
-    if (!call) {
-        return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
-    }
-    if (interaction.user.id !== call.ownerId) {
-        return interaction.reply({ content: 'Alleen de eigenaar kan mensen toelaten.', flags: MessageFlags.Ephemeral });
-    }
-
-    const userId = interaction.values[0];
-    try {
-        const channel = await client.channels.fetch(channelId);
-        await channel.permissionOverwrites.edit(userId, {
-            ViewChannel: true,
-            Connect: true
-        });
-        if (!callAllowed.has(channelId)) callAllowed.set(channelId, new Set());
-        callAllowed.get(channelId).add(userId);
-        await interaction.reply({ content: `<@${userId}> is toegelaten tot de call.`, flags: MessageFlags.Ephemeral });
-    } catch (err) {
-        console.error('Fout bij toelaten user:', err);
-        await interaction.reply({ content: 'Kon de gebruiker niet toelaten.', flags: MessageFlags.Ephemeral }).catch(() => {});
     }
 });
 
