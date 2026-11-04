@@ -25,7 +25,7 @@ const {
 const PORT = process.env.PORT || 3000;
 http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Snus bot is online');
+    res.end('Familie Snus bot is online');
 }).listen(PORT, () => {
     console.log(`HTTP server luistert op poort ${PORT}`);
 });
@@ -42,7 +42,7 @@ const CONFIG = {
     TOKEN: process.env.DISCORD_TOKEN,
     GITHUB_TOKEN: process.env.GITHUB_TOKEN,
     GIST_ID: process.env.GIST_ID || '',
-    SERVER_NAME: 'Snus',
+    SERVER_NAME: 'Familie Snus',
     LOGO_URL: 'https://cdn.discordapp.com/attachments/1567554042039771136/1567660546663383102/40134efe-7805-4254-90b6-79de4620ed6a.png?ex=6aecfd28&is=6aebaba8&hm=80fdcf3fc87f2b51afda037cb67f29aeaf84de04cda3b25c52d8a44e9f9ee6c6&',
 
     WELCOME_CHANNEL_ID: '1567280566041190410',
@@ -94,21 +94,21 @@ const CONFIG = {
 };
 
 const FIXED_RANKS = [
-    { name: '𝐒𝐧𝐮𝐬 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106', level: 100 },
-    { name: '𝐒𝐧𝐮𝐬 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450', level: 90 },
-    { name: '𝐒𝐧𝐮𝐬 𝐃𝐢𝐜𝐭𝐚𝐭𝐨𝐫', roleId: '1567245029255413890', level: 80 },
-    { name: '𝐒𝐧𝐮𝐬 𝐋𝐮𝐢𝐭𝐞𝐧𝐚𝐧𝐭', roleId: '1567264503744299109', level: 70 },
-    { name: '𝐒𝐧𝐮𝐬 𝐆𝐞𝐧𝐞𝐫𝐚𝐥', roleId: '1567246499069566987', level: 60 },
-    { name: '𝐒𝐧𝐮𝐬 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459', level: 50 }
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106', level: 100 },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450', level: 90 },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐃𝐢𝐜𝐭𝐚𝐭𝐨𝐫', roleId: '1567245029255413890', level: 80 },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐋𝐮𝐢𝐭𝐞𝐧𝐚𝐧𝐭', roleId: '1567264503744299109', level: 70 },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐆𝐞𝐧𝐞𝐫𝐚𝐥', roleId: '1567246499069566987', level: 60 },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459', level: 50 }
 ];
 
 const DEFAULT_CUSTOM_ROLES = [
-    { name: '𝐒𝐧𝐮𝐬 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106' },
-    { name: '𝐒𝐧𝐮𝐬 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450' },
-    { name: '𝐒𝐧𝐮𝐬 𝐃𝐢𝐜𝐭𝐚𝐭𝐨𝐫', roleId: '1567245029255413890' },
-    { name: '𝐒𝐧𝐮𝐬 𝐋𝐮𝐢𝐭𝐞𝐧𝐚𝐧𝐭', roleId: '1567264503744299109' },
-    { name: '𝐒𝐧𝐮𝐬 𝐆𝐞𝐧𝐞𝐫𝐚𝐥', roleId: '1567246499069566987' },
-    { name: '𝐒𝐧𝐮𝐬 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459' }
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106' },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450' },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐃𝐢𝐜𝐭𝐚𝐭𝐨𝐫', roleId: '1567245029255413890' },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐋𝐮𝐢𝐭𝐞𝐧𝐚𝐧𝐭', roleId: '1567264503744299109' },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐆𝐞𝐧𝐞𝐫𝐚𝐥', roleId: '1567246499069566987' },
+    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459' }
 ];
 
 let customRoles = [];
@@ -129,7 +129,7 @@ async function gistRequest(method, endpoint, body) {
         headers: {
             'Authorization': `Bearer ${CONFIG.GITHUB_TOKEN}`,
             'Accept': 'application/vnd.github+json',
-            'User-Agent': 'Snus-Bot',
+            'User-Agent': 'Familie-Snus-Bot',
             'Content-Type': 'application/json'
         }
     };
@@ -154,7 +154,7 @@ async function initGist() {
             console.log(`Gist geladen: ${gistId}`);
         } else {
             const gist = await gistRequest('POST', '/gists', {
-                description: 'Snus bot database',
+                description: 'Familie Snus bot database',
                 public: false,
                 files: {
                     [GIST_FILE]: {
@@ -205,8 +205,10 @@ async function loadFromGist() {
 
 async function migrateDefaultCustomRoles() {
     for (const cr of customRoles) {
-        if (cr.name && cr.name.startsWith('𝐙𝐨𝐞𝐭')) {
-            cr.name = cr.name.replace(/^𝐙𝐨𝐞𝐭/, '𝐒𝐧𝐮𝐬');
+        if (cr.name && cr.name.startsWith('𝐒𝐧𝐮𝐬')) {
+            cr.name = cr.name.replace(/^𝐒𝐧𝐮𝐬/, '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬');
+        } else if (cr.name && cr.name.startsWith('𝐙𝐨𝐞𝐭')) {
+            cr.name = cr.name.replace(/^𝐙𝐨𝐞𝐭/, '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬');
         }
     }
 
@@ -502,10 +504,10 @@ function buildMembersEmbed(guild) {
         body += `\n`;
     }
 
-    const description = `**Totale Snus: ${uniqueMembers.size} leden**\n\n${body}`;
+    const description = `**Totale Familie Snus: ${uniqueMembers.size} leden**\n\n${body}`;
 
     return new EmbedBuilder()
-        .setTitle('Snus Ledenlijst')
+        .setTitle('Familie Snus Ledenlijst')
         .setColor(PURPLE.main)
         .setDescription(description.slice(0, 4096))
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
@@ -579,7 +581,7 @@ function buildCustomRolePanelEmbed() {
     return new EmbedBuilder()
         .setTitle('Custom Roles Beheer')
         .setDescription(
-            'Beheer hier de custom rollen van **Snus**.\n\n' +
+            'Beheer hier de custom rollen van **Familie Snus**.\n\n' +
             '**Huidige custom rollen:**\n' + list + '\n\n' +
             'Alleen leden met de rol manager kunnen rollen toevoegen, verwijderen, hernoemen of van volgorde wisselen. Nieuwe rollen komen automatisch in het lettertype en verschijnen in de ledenlijst.'
         )
@@ -663,7 +665,6 @@ async function updateCustomRolePanel() {
     }
 }
 
-// --- ANTI-LINK SPAM ---
 async function handleAntiLink(message) {
     if (message.author.bot) return false;
     if (!message.guild) return false;
@@ -693,7 +694,6 @@ async function handleAntiLink(message) {
     }
 }
 
-// --- GIVEAWAY SYSTEEM ---
 function buildGiveawayEmbed(giveaway) {
     const ended = giveaway.ended;
     return new EmbedBuilder()
@@ -834,15 +834,23 @@ async function handleGiveawayButton(interaction) {
         if (gw.participants.length === 0) {
             return interaction.reply({ content: 'Er zijn geen deelnemers om te rerollen.', flags: MessageFlags.Ephemeral });
         }
+        if (!gw.winners || gw.winners.length === 0) {
+            return interaction.reply({ content: 'Deze giveaway heeft nog geen winnaar.', flags: MessageFlags.Ephemeral });
+        }
 
-        const select = new UserSelectMenuBuilder()
-            .setCustomId(`gw_reroll_select_${messageId}`)
-            .setPlaceholder('Kies de nieuwe winnaar')
-            .setMinValues(1)
-            .setMaxValues(1);
+        // Stap 1: kies de oude winnaar die niet heeft geclaimd
+        const options = gw.winners.map(id => ({
+            label: `Oude winnaar: ${id}`,
+            value: id
+        }));
+
+        const select = new StringSelectMenuBuilder()
+            .setCustomId(`gw_reroll_old_${messageId}`)
+            .setPlaceholder('Kies de oude winnaar die niet heeft geclaimd')
+            .addOptions(options);
 
         return interaction.reply({
-            content: 'Kies de nieuwe winnaar:',
+            content: 'Kies de oude winnaar die niet heeft geclaimd:',
             components: [new ActionRowBuilder().addComponents(select)],
             flags: MessageFlags.Ephemeral
         });
@@ -1434,11 +1442,11 @@ client.once('clientReady', async () => {
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
-            await cleanupOldPanels(verifyChannel, 'Welkom bij Snus');
+            await cleanupOldPanels(verifyChannel, 'Welkom bij Familie Snus');
             const verifyCount = await countRoleMembers(verifyChannel.guild, CONFIG.VERIFY_ROLE_ID, true);
             const embed = new EmbedBuilder()
-                .setTitle('Snus Verification')
-                .setDescription('Welkom bij Snus!\n\nKlik op de knop hieronder om jezelf te verifiëren en toegang te krijgen tot de server.')
+                .setTitle('Familie Snus Verification')
+                .setDescription('Welkom bij Familie Snus!\n\nKlik op de knop hieronder om jezelf te verifiëren en toegang te krijgen tot de server.')
                 .setColor(PURPLE.main)
                 .setThumbnail(CONFIG.LOGO_URL);
             const button = new ButtonBuilder()
@@ -1613,16 +1621,6 @@ client.on('guildMemberRemove', async (member) => {
             thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     }
-
-    if (!antinukeData.enabled) return;
-    const executor = await findExecutor(member.guild, AuditLogEvent.MemberKick, member.id);
-    if (!executor) return;
-    if (executor.id === client.user.id) return;
-    if (CONFIG.ANTINUKE_ALLOWED_USERS.includes(executor.id)) return;
-
-    if (checkThreshold(executor.id, 'kickAdd')) {
-        await punishUser(member.guild, executor.id, `Te veel kicks binnen ${CONFIG.ANTINUKE_WINDOW_MS / 1000}s`);
-    }
 });
 
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
@@ -1699,6 +1697,63 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
         });
     }
 });
+
+// --- ANTI-NUKE HELPERS ---
+function checkThreshold(userId, type) {
+    const key = `${userId}:${type}`;
+    const now = Date.now();
+    const list = (actionTracker.get(key) || []).filter(t => now - t < CONFIG.ANTINUKE_WINDOW_MS);
+    list.push(now);
+    actionTracker.set(key, list);
+    const limit = CONFIG.ANTINUKE_LIMITS[type] || 999;
+    return list.length >= limit;
+}
+
+async function findExecutor(guild, type, targetId) {
+    try {
+        const logs = await guild.fetchAuditLogs({ type, limit: 5 });
+        const entry = logs.entries.find(e =>
+            (!targetId || e.target?.id === targetId) &&
+            Date.now() - e.createdTimestamp < 15000
+        );
+        return entry ? entry.executor : null;
+    } catch (err) {
+        return null;
+    }
+}
+
+async function punishUser(guild, userId, reason) {
+    try {
+        const member = await guild.members.fetch(userId).catch(() => null);
+        if (!member) return;
+        const removable = member.roles.cache.filter(r =>
+            r.id !== guild.id && guild.members.me.roles.highest.position > r.position
+        );
+        if (removable.size > 0) {
+            await member.roles.remove(removable, `Anti-nuke: ${reason}`).catch(() => {});
+        }
+        await member.kick(`Anti-nuke: ${reason}`).catch(() => {});
+        await sendLog(guild, CONFIG.JOIN_LEAVE_LOG_ID, {
+            title: '🚨 Anti-nuke actie',
+            description: `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n**Reden:** ${reason}`,
+            color: PURPLE.dark,
+            thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
+        });
+    } catch (err) {
+        console.error('Fout bij straffen user:', err);
+    }
+}
+
+async function handleNukeAction(guild, type, targetId) {
+    if (!antinukeData.enabled) return;
+    const executor = await findExecutor(guild, type, targetId);
+    if (!executor) return;
+    if (executor.id === client.user.id) return;
+    if (CONFIG.ANTINUKE_ALLOWED_USERS.includes(executor.id)) return;
+    if (checkThreshold(executor.id, type)) {
+        await punishUser(guild, executor.id, `Te veel ${type} acties binnen ${CONFIG.ANTINUKE_WINDOW_MS / 1000}s`);
+    }
+}
 
 client.on('channelDelete', async (channel) => {
     if (!channel.guild) return;
@@ -2247,36 +2302,84 @@ client.on('interactionCreate', async (interaction) => {
             });
             return;
         }
-        return;
-    }
 
-    if (interaction.isUserSelectMenu()) {
-        if (interaction.customId.startsWith('gw_reroll_select_')) {
+        // Reroll stap 1: oude winnaar kiezen
+        if (interaction.customId.startsWith('gw_reroll_old_')) {
             if (!isGiveawayManager(interaction)) {
                 return interaction.reply({ content: 'Je hebt geen toestemming om te rerollen.', flags: MessageFlags.Ephemeral });
             }
-            const messageId = interaction.customId.replace('gw_reroll_select_', '');
+            const messageId = interaction.customId.replace('gw_reroll_old_', '');
             const gw = giveaways[messageId];
             if (!gw) {
                 return interaction.reply({ content: 'Deze giveaway bestaat niet meer.', flags: MessageFlags.Ephemeral });
             }
+            const oldWinner = interaction.values[0];
+            if (!gw.winners.includes(oldWinner)) {
+                return interaction.reply({ content: 'Deze gebruiker was geen winnaar.', flags: MessageFlags.Ephemeral });
+            }
+
+            // Stap 2: nieuwe winnaar kiezen uit deelnemers die nog geen winnaar waren
+            const eligible = gw.participants.filter(id => !gw.winners.includes(id) && id !== oldWinner);
+            if (eligible.length === 0) {
+                return interaction.reply({ content: 'Er zijn geen andere deelnemers om als nieuwe winnaar te kiezen.', flags: MessageFlags.Ephemeral });
+            }
+
+            const options = eligible.slice(0, 25).map(id => ({
+                label: `Deelnemer: ${id}`,
+                value: id
+            }));
+
+            const select = new StringSelectMenuBuilder()
+                .setCustomId(`gw_reroll_new_${messageId}_${oldWinner}`)
+                .setPlaceholder('Kies de nieuwe winnaar')
+                .addOptions(options);
+
+            return interaction.update({
+                content: `Oude winnaar: <@${oldWinner}>. Kies de nieuwe winnaar:`,
+                components: [new ActionRowBuilder().addComponents(select)]
+            });
+        }
+
+        // Reroll stap 2: nieuwe winnaar kiezen
+        if (interaction.customId.startsWith('gw_reroll_new_')) {
+            if (!isGiveawayManager(interaction)) {
+                return interaction.reply({ content: 'Je hebt geen toestemming om te rerollen.', flags: MessageFlags.Ephemeral });
+            }
+            const rest = interaction.customId.replace('gw_reroll_new_', '');
+            const parts = rest.split('_');
+            const oldWinner = parts.pop();
+            const messageId = parts.join('_');
+
+            const gw = giveaways[messageId];
+            if (!gw) {
+                return interaction.reply({ content: 'Deze giveaway bestaat niet meer.', flags: MessageFlags.Ephemeral });
+            }
+
             const newWinner = interaction.values[0];
             if (!gw.participants.includes(newWinner)) {
                 return interaction.reply({ content: 'Deze gebruiker deed niet mee aan de giveaway.', flags: MessageFlags.Ephemeral });
             }
-            gw.winners = [newWinner];
+
+            // Vervang de oude winnaar door de nieuwe
+            const winnerIdx = gw.winners.indexOf(oldWinner);
+            if (winnerIdx === -1) {
+                return interaction.reply({ content: 'De oude winnaar is niet meer geldig.', flags: MessageFlags.Ephemeral });
+            }
+            gw.winners[winnerIdx] = newWinner;
             await saveToGist();
+
             try {
                 const channel = await client.channels.fetch(gw.channelId);
                 const msg = await channel.messages.fetch(messageId);
                 await msg.edit({ embeds: [buildGiveawayEmbed(gw)], components: buildGiveawayRows(messageId, true) });
-                await channel.send(`🔁 Nieuwe winnaar: <@${newWinner}>! Je hebt **${gw.prize}** gewonnen.`);
+                await channel.send(`🔁 Nieuwe winnaar: <@${newWinner}>! Je hebt **${gw.prize}** gewonnen (oude winnaar <@${oldWinner}> had niet geclaimd).`);
             } catch (err) {}
 
             await sendLog(interaction.guild, CONFIG.GIVEAWAY_LOG_ID, {
                 title: '🔁 Giveaway reroll',
                 description:
                     `**Prijs:** ${gw.prize}\n` +
+                    `**Oude winnaar:** <@${oldWinner}>\n` +
                     `**Nieuwe winnaar:** <@${newWinner}>\n` +
                     `**Door:** ${interaction.user.tag} (\`${interaction.user.id}\`)`,
                 color: PURPLE.main,
@@ -2375,7 +2478,7 @@ client.on('interactionCreate', async (interaction) => {
 
     if (!interaction.isButton()) return;
 
-    if (interaction.customId.startsWith('gw_join_') || (interaction.customId.startsWith('gw_reroll_') && !interaction.customId.startsWith('gw_reroll_select_'))) {
+    if (interaction.customId.startsWith('gw_join_') || (interaction.customId.startsWith('gw_reroll_') && !interaction.customId.startsWith('gw_reroll_old_') && !interaction.customId.startsWith('gw_reroll_new_'))) {
         return handleGiveawayButton(interaction);
     }
 
@@ -2392,7 +2495,7 @@ client.on('interactionCreate', async (interaction) => {
             .setStyle(TextInputStyle.Short)
             .setMaxLength(50)
             .setRequired(true)
-            .setPlaceholder('bijv. Snus Dictator');
+            .setPlaceholder('bijv. Familie Snus Dictator');
         modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
     }
@@ -2604,7 +2707,7 @@ client.on('interactionCreate', async (interaction) => {
                     .setStyle(ButtonStyle.Success)
             );
             await interaction.message.edit({ components: [newRow] }).catch(() => {});
-            await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Snus.', flags: MessageFlags.Ephemeral });
+            await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Familie Snus.', flags: MessageFlags.Ephemeral });
         } catch (err) {
             console.error('Fout bij verify:', err);
             if (!interaction.replied) {
