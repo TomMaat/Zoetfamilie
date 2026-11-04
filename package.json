@@ -1,7 +1,7 @@
 {
-  "name": "zoet-family-bot",
+  "name": "snus-bot",
   "version": "1.0.0",
-  "description": "Familie Zoet",
+  "description": "Snus",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
