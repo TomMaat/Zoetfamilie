@@ -50,7 +50,6 @@ const CONFIG = {
     CALL_CHANNEL_ID: '1567542253633933402',
     CALL_CATEGORY_ID: '1567297941146829040',
 
-    // Log kanalen
     VERIFY_LOG_ID: '1567547632211988640',
     SNAP_LOG_ID: '1567547761912578141',
     CALL_LOG_ID: '1567547888119058562',
@@ -78,7 +77,7 @@ const GIST_FILE = 'zoet.json';
 let gistId = CONFIG.GIST_ID;
 let kickData = { total: 0 };
 let antinukeData = { enabled: true };
-let joinTimes = {}; // userId -> timestamp (voor verblijfsduur)
+let joinTimes = {};
 let gistReady = false;
 
 async function gistRequest(method, endpoint, body) {
@@ -188,7 +187,6 @@ function toFont(text) {
     return text.split('').map(ch => FONT_MAP[ch] || ch).join('');
 }
 
-// --- TIJD HELPER ---
 function formatDuration(ms) {
     const sec = Math.floor(ms / 1000);
     const d = Math.floor(sec / 86400);
@@ -219,16 +217,31 @@ const client = new Client({
 const actionTracker = new Map();
 const activeCalls = new Map();
 const callAllowed = new Map();
+const roleCountCache = new Map(); // roleId -> { count, fetchedAt }
 
 // --- HELPERS ---
-async function countRoleMembers(guild, roleId) {
+
+// Telt leden met een rol, gebruikt cache en doet max 1 fetch per minuut
+async function countRoleMembers(guild, roleId, forceFetch = false) {
+    const now = Date.now();
+    const cached = roleCountCache.get(roleId);
+
+    // Gebruik cache als die minder dan 60s oud is en niet geforceerd
+    if (!forceFetch && cached && now - cached.fetchedAt < 60000) {
+        return cached.count;
+    }
+
     try {
         await guild.members.fetch();
     } catch (err) {
-        console.error('Fout bij members fetch:', err);
+        // Bij rate limit: gebruik cache of fallback naar role.members.size
+        console.error('Fout bij members fetch:', err.message);
     }
+
     const role = guild.roles.cache.get(roleId);
-    return role ? role.members.size : 0;
+    const count = role ? role.members.size : 0;
+    roleCountCache.set(roleId, { count, fetchedAt: now });
+    return count;
 }
 
 async function cleanupOldPanels(channel, markerText) {
@@ -280,7 +293,8 @@ async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
         );
         if (!panel) return;
 
-        const count = await countRoleMembers(channel.guild, roleId);
+        // Geen fetch forceren; gebruik cache
+        const count = await countRoleMembers(channel.guild, roleId, false);
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
                 .setCustomId(buttonId)
@@ -294,7 +308,6 @@ async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
     }
 }
 
-// Stuurt een log naar een specifiek kanaal
 async function sendLog(guild, channelId, { title, description, color, thumbnail }) {
     try {
         const channel = guild.channels.cache.get(channelId);
@@ -441,7 +454,6 @@ async function setupCallCategory(guild) {
 }
 
 function buildCallInfoMessage(channelId, ownerId, isPrivate) {
-    const call = activeCalls.get(channelId);
     const allowed = callAllowed.get(channelId) || new Set();
 
     let allowedList = '_Niemand anders heeft toegang._';
@@ -547,7 +559,7 @@ async function createCall(interaction, name, isPrivate) {
     });
     callAllowed.set(channel.id, new Set([member.id]));
 
-    const payload = await buildCallInfoMessage(channel.id, member.id, isPrivate);
+    const payload = buildCallInfoMessage(channel.id, member.id, isPrivate);
     await interaction.editReply(payload);
 
     await sendLog(guild, CONFIG.CALL_LOG_ID, {
@@ -601,11 +613,12 @@ client.once('clientReady', async () => {
         console.error('Fout bij registreren commands:', err);
     }
 
+    // Verify panel — geen geforceerde fetch meer
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
             await cleanupOldPanels(verifyChannel, 'Welkom bij Familie Zoet');
-            const verifyCount = await countRoleMembers(verifyChannel.guild, CONFIG.VERIFY_ROLE_ID);
+            const verifyCount = await countRoleMembers(verifyChannel.guild, CONFIG.VERIFY_ROLE_ID, true);
             const embed = new EmbedBuilder()
                 .setTitle('Familie Zoet Verification')
                 .setDescription('Welkom bij Familie Zoet!\n\nKlik op de knop hieronder om jezelf te verifiëren en toegang te krijgen tot de server.')
@@ -624,11 +637,14 @@ client.once('clientReady', async () => {
         console.error('Fout bij verify panel:', err);
     }
 
+    // Wacht 5 seconden voor snapchat panel om rate limit te vermijden
+    await new Promise(r => setTimeout(r, 5000));
+
     try {
         const snapChannel = await client.channels.fetch(CONFIG.SNAP_CHANNEL_ID);
         if (snapChannel) {
             await cleanupOldPanels(snapChannel, 'Snapchat Ping');
-            const snapCount = await countRoleMembers(snapChannel.guild, CONFIG.SNAP_ROLE_ID);
+            const snapCount = await countRoleMembers(snapChannel.guild, CONFIG.SNAP_ROLE_ID, false);
             const embed = new EmbedBuilder()
                 .setTitle('Snapchat Ping')
                 .setDescription(
@@ -681,7 +697,6 @@ client.once('clientReady', async () => {
 client.on('guildMemberAdd', async (member) => {
     updateStatus(member.guild);
 
-    // Sla join-tijd op voor verblijfsduur
     joinTimes[member.id] = Date.now();
     await saveToGist();
 
@@ -716,7 +731,6 @@ client.on('guildMemberAdd', async (member) => {
         await member.send({ embeds: [dmEmbed] });
     } catch (err) {}
 
-    // Join log
     await sendLog(member.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
         title: '📥 Lid gejoint',
         description:
@@ -728,7 +742,6 @@ client.on('guildMemberAdd', async (member) => {
     });
 });
 
-// --- LEAVE LOG met verblijfsduur + verify/snap logs ---
 client.on('guildMemberRemove', async (member) => {
     updateStatus(member.guild);
 
@@ -743,7 +756,6 @@ client.on('guildMemberRemove', async (member) => {
     const hadVerify = member.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
     const hadSnap = member.roles.cache.has(CONFIG.SNAP_ROLE_ID);
 
-    // Leave log
     await sendLog(member.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
         title: '📤 Lid verlaten',
         description:
@@ -786,7 +798,7 @@ client.on('guildMemberRemove', async (member) => {
     }
 });
 
-// --- ROLLEN + DM NA VERIFY + aparte logs ---
+// --- ROLLEN + DM NA VERIFY ---
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const oldVerify = oldMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
     const newVerify = newMember.roles.cache.has(CONFIG.VERIFY_ROLE_ID);
@@ -794,6 +806,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const newSnap = newMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
 
     if (!oldVerify && newVerify) {
+        roleCountCache.delete(CONFIG.VERIFY_ROLE_ID);
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
         await sendLog(newMember.guild, CONFIG.VERIFY_LOG_ID, {
             title: '✅ Verify gekregen',
@@ -813,6 +826,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
             await newMember.send({ embeds: [dmEmbed] });
         } catch (err) {}
     } else if (oldVerify && !newVerify) {
+        roleCountCache.delete(CONFIG.VERIFY_ROLE_ID);
         await refreshPanel(CONFIG.VERIFY_CHANNEL_ID, CONFIG.VERIFY_BUTTON_ID, '✅', ButtonStyle.Success, CONFIG.VERIFY_ROLE_ID);
         await sendLog(newMember.guild, CONFIG.VERIFY_LOG_ID, {
             title: '❌ Verify verwijderd',
@@ -823,6 +837,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     }
 
     if (!oldSnap && newSnap) {
+        roleCountCache.delete(CONFIG.SNAP_ROLE_ID);
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
         await sendLog(newMember.guild, CONFIG.SNAP_LOG_ID, {
             title: '👻 Snapchat Ping gekregen',
@@ -831,6 +846,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
             thumbnail: newMember.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
     } else if (oldSnap && !newSnap) {
+        roleCountCache.delete(CONFIG.SNAP_ROLE_ID);
         await refreshPanel(CONFIG.SNAP_CHANNEL_ID, CONFIG.SNAP_BUTTON_ID, '👻', ButtonStyle.Primary, CONFIG.SNAP_ROLE_ID);
         await sendLog(newMember.guild, CONFIG.SNAP_LOG_ID, {
             title: '❌ Snapchat Ping verwijderd',
@@ -1008,17 +1024,22 @@ client.on('interactionCreate', async (interaction) => {
         return;
     }
 
+    // Modal submit: DEFER eerst, dan kanaal maken
     if (interaction.isModalSubmit()) {
         if (interaction.customId === 'call_modal_public' || interaction.customId === 'call_modal_private') {
             const isPrivate = interaction.customId === 'call_modal_private';
             const name = interaction.fields.getTextInputValue('call_name');
+
+            // Defer meteen zodat de interaction niet verloopt
+            await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
+
             try {
                 await createCall(interaction, name, isPrivate);
             } catch (err) {
                 console.error('Fout bij maken call:', err);
-                if (!interaction.replied) {
-                    await interaction.reply({ content: 'Kon de call niet aanmaken.', flags: MessageFlags.Ephemeral }).catch(() => {});
-                }
+                try {
+                    await interaction.editReply({ content: 'Kon de call niet aanmaken.', embeds: [], components: [] });
+                } catch (e) {}
             }
         }
         return;
@@ -1075,7 +1096,6 @@ client.on('interactionCreate', async (interaction) => {
                 const allowed = callAllowed.get(channelId);
                 if (allowed) allowed.delete(userId);
 
-                // Verplaats de user uit de call indien die erin zit
                 const voiceMember = channel.members.get(userId);
                 if (voiceMember) {
                     await voiceMember.voice.disconnect('Verwijderd uit call door eigenaar').catch(() => {});
@@ -1196,7 +1216,7 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: 'Je bent al geverifieerd!', flags: MessageFlags.Ephemeral });
             }
             await interaction.member.roles.add(role);
-            const newCount = await countRoleMembers(interaction.guild, CONFIG.VERIFY_ROLE_ID);
+            const newCount = await countRoleMembers(interaction.guild, CONFIG.VERIFY_ROLE_ID, true);
             const newRow = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId(CONFIG.VERIFY_BUTTON_ID)
@@ -1225,7 +1245,7 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: 'Je hebt de Snapchat Ping rol al!', flags: MessageFlags.Ephemeral });
             }
             await interaction.member.roles.add(role);
-            const newCount = await countRoleMembers(interaction.guild, CONFIG.SNAP_ROLE_ID);
+            const newCount = await countRoleMembers(interaction.guild, CONFIG.SNAP_ROLE_ID, true);
             const newRow = new ActionRowBuilder().addComponents(
                 new ButtonBuilder()
                     .setCustomId(CONFIG.SNAP_BUTTON_ID)
