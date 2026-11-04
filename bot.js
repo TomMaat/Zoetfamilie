@@ -55,6 +55,7 @@ const CONFIG = {
     SNAP_BUTTON_ID: 'snap_ping_click',
 
     HONEYPOT_CHANNEL_ID: '1567295355740229733',
+    HONEYPOT_LOG_ID: '1567670737073078344',
 
     CALL_CHANNEL_ID: '1567542253633933402',
     CALL_CATEGORY_ID: '1567297941146829040',
@@ -838,7 +839,6 @@ async function handleGiveawayButton(interaction) {
             return interaction.reply({ content: 'Deze giveaway heeft nog geen winnaar.', flags: MessageFlags.Ephemeral });
         }
 
-        // Stap 1: kies de oude winnaar die niet heeft geclaimd
         const options = gw.winners.map(id => ({
             label: `Oude winnaar: ${id}`,
             value: id
@@ -938,6 +938,7 @@ async function createBackup(guild, user) {
             SNAP_CHANNEL_ID: CONFIG.SNAP_CHANNEL_ID,
             SNAP_ROLE_ID: CONFIG.SNAP_ROLE_ID,
             HONEYPOT_CHANNEL_ID: CONFIG.HONEYPOT_CHANNEL_ID,
+            HONEYPOT_LOG_ID: CONFIG.HONEYPOT_LOG_ID,
             CALL_CHANNEL_ID: CONFIG.CALL_CHANNEL_ID,
             CALL_CATEGORY_ID: CONFIG.CALL_CATEGORY_ID,
             VERIFY_LOG_ID: CONFIG.VERIFY_LOG_ID,
@@ -1087,7 +1088,7 @@ async function loadBackup(guild, backupId) {
     if (backup.botConfig) {
         const mapKeys = [
             'WELCOME_CHANNEL_ID', 'VERIFY_CHANNEL_ID', 'VERIFY_ROLE_ID',
-            'SNAP_CHANNEL_ID', 'SNAP_ROLE_ID', 'HONEYPOT_CHANNEL_ID',
+            'SNAP_CHANNEL_ID', 'SNAP_ROLE_ID', 'HONEYPOT_CHANNEL_ID', 'HONEYPOT_LOG_ID',
             'CALL_CHANNEL_ID', 'CALL_CATEGORY_ID',
             'VERIFY_LOG_ID', 'SNAP_LOG_ID', 'CALL_LOG_ID', 'JOIN_LEAVE_LOG_ID',
             'MEMBERS_LIST_CHANNEL_ID', 'CUSTOM_ROLE_PANEL_CHANNEL_ID',
@@ -1791,6 +1792,19 @@ client.on('messageCreate', async (message) => {
                 .setColor(PURPLE.dark)
                 .setTimestamp();
             await message.channel.send({ embeds: [embed] }).catch(() => {});
+
+            // Honeypot log
+            await sendLog(message.guild, CONFIG.HONEYPOT_LOG_ID, {
+                title: '🍯 Honeypot kick',
+                description:
+                    `**Gebruiker:** ${message.author.tag} (\`${message.author.id}\`)\n` +
+                    `**Actie:** KICK\n` +
+                    `**Kanaal:** <#${CONFIG.HONEYPOT_CHANNEL_ID}>\n` +
+                    `**Totaal aantal kicks:** ${kickData.total}\n` +
+                    `**Bericht:** ${message.content ? message.content.slice(0, 200) : '_Geen tekst_'}`,
+                color: PURPLE.dark,
+                thumbnail: message.author.displayAvatarURL({ dynamic: true, size: 128 })
+            });
         } catch (err) {
             console.error('Fout bij honeypot kick:', err);
         }
@@ -1800,6 +1814,7 @@ client.on('messageCreate', async (message) => {
     if (message.guild) {
         const protectedChannels = [
             CONFIG.HONEYPOT_CHANNEL_ID,
+            CONFIG.HONEYPOT_LOG_ID,
             CONFIG.VERIFY_LOG_ID,
             CONFIG.SNAP_LOG_ID,
             CONFIG.CALL_LOG_ID,
@@ -2303,7 +2318,6 @@ client.on('interactionCreate', async (interaction) => {
             return;
         }
 
-        // Reroll stap 1: oude winnaar kiezen
         if (interaction.customId.startsWith('gw_reroll_old_')) {
             if (!isGiveawayManager(interaction)) {
                 return interaction.reply({ content: 'Je hebt geen toestemming om te rerollen.', flags: MessageFlags.Ephemeral });
@@ -2318,7 +2332,6 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: 'Deze gebruiker was geen winnaar.', flags: MessageFlags.Ephemeral });
             }
 
-            // Stap 2: nieuwe winnaar kiezen uit deelnemers die nog geen winnaar waren
             const eligible = gw.participants.filter(id => !gw.winners.includes(id) && id !== oldWinner);
             if (eligible.length === 0) {
                 return interaction.reply({ content: 'Er zijn geen andere deelnemers om als nieuwe winnaar te kiezen.', flags: MessageFlags.Ephemeral });
@@ -2340,7 +2353,6 @@ client.on('interactionCreate', async (interaction) => {
             });
         }
 
-        // Reroll stap 2: nieuwe winnaar kiezen
         if (interaction.customId.startsWith('gw_reroll_new_')) {
             if (!isGiveawayManager(interaction)) {
                 return interaction.reply({ content: 'Je hebt geen toestemming om te rerollen.', flags: MessageFlags.Ephemeral });
@@ -2360,7 +2372,6 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.reply({ content: 'Deze gebruiker deed niet mee aan de giveaway.', flags: MessageFlags.Ephemeral });
             }
 
-            // Vervang de oude winnaar door de nieuwe
             const winnerIdx = gw.winners.indexOf(oldWinner);
             if (winnerIdx === -1) {
                 return interaction.reply({ content: 'De oude winnaar is niet meer geldig.', flags: MessageFlags.Ephemeral });
