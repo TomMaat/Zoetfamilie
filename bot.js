@@ -75,6 +75,9 @@ const CONFIG = {
     GIVEAWAY_MANAGER_ROLE_ID: '1567237645057261689',
 
     ANTI_LINK_TIMEOUT_MS: 60 * 60 * 1000,
+    ANTI_LINK_WINDOW_MS: 60 * 1000,
+    ANTI_LINK_WARN_THRESHOLD: 3,
+
     MAX_CALLS_PER_USER: 1,
 
     EMPTY_CALL_TIMEOUT_MS: 60 * 60 * 1000,
@@ -316,6 +319,7 @@ const activeCalls = new Map();
 const callAllowed = new Map();
 const roleCountCache = new Map();
 const callInfoMessages = new Map();
+const linkTracker = new Map();
 
 let membersListMessageId = null;
 let membersUpdateTimeout = null;
@@ -669,28 +673,56 @@ async function updateCustomRolePanel() {
 async function handleAntiLink(message) {
     if (message.author.bot) return false;
     if (!message.guild) return false;
+
+    // Bypass voor moderators en de manager rol
     if (message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) return false;
+    if (message.member?.roles?.cache?.has(CONFIG.CUSTOM_ROLE_MANAGER_ROLE_ID)) return false;
 
     const content = message.content || '';
     const linkRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|(discord\.gg\/[^\s]+)/i;
     if (!linkRegex.test(content)) return false;
 
+    const userId = message.author.id;
+    const now = Date.now();
+
+    const timestamps = (linkTracker.get(userId) || []).filter(t => now - t < CONFIG.ANTI_LINK_WINDOW_MS);
+    timestamps.push(now);
+    linkTracker.set(userId, timestamps);
+
+    const count = timestamps.length;
+
+    if (count < CONFIG.ANTI_LINK_WARN_THRESHOLD) {
+        return false;
+    }
+
+    if (count === CONFIG.ANTI_LINK_WARN_THRESHOLD) {
+        try {
+            await message.channel.send({
+                content: `${message.author} - Je hebt **3 links** in 1 minuut gestuurd. Als je **nog 1 link** stuurt binnen 1 minuut, wordt die link verwijderd en krijg je **1 uur timeout** voor anti-link spam.`
+            }).catch(() => {});
+        } catch (err) {
+            console.error('Fout bij anti-link waarschuwing:', err);
+        }
+        return false;
+    }
+
     try {
         await message.delete().catch(() => {});
-        const member = message.member;
-        if (!member) return true;
 
-        if (member.moderatable) {
-            await member.timeout(CONFIG.ANTI_LINK_TIMEOUT_MS, 'Anti-link: link gestuurd').catch(() => {});
+        const member = message.member;
+
+        await message.channel.send({
+            content: `${message.author} - Je link is verwijderd en je krijgt **1 uur timeout** voor anti-link spam.`
+        }).catch(() => {});
+
+        if (member && member.moderatable) {
+            await member.timeout(CONFIG.ANTI_LINK_TIMEOUT_MS, 'Anti-link spam: te veel links binnen 1 minuut').catch(() => {});
         }
 
-        const channel = message.channel;
-        await channel.send({
-            content: `${message.author} - links zijn hier niet toegestaan. Je bent voor 1 uur getime-out.`
-        }).catch(() => {});
+        linkTracker.delete(userId);
         return true;
     } catch (err) {
-        console.error('Fout bij anti-link:', err);
+        console.error('Fout bij anti-link timeout:', err);
         return true;
     }
 }
@@ -1793,7 +1825,6 @@ client.on('messageCreate', async (message) => {
                 .setTimestamp();
             await message.channel.send({ embeds: [embed] }).catch(() => {});
 
-            // Honeypot log
             await sendLog(message.guild, CONFIG.HONEYPOT_LOG_ID, {
                 title: '🍯 Honeypot kick',
                 description:
