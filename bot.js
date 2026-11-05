@@ -91,7 +91,7 @@ const CONFIG = {
 
     CASINO_EMBED_DELETE_AFTER_MS: 8000,
 
-    // CRASHER — terug naar 0.5 per tick, snel
+    // CRASHER — 0.1 per seconde (rustig tempo)
     CRASHER_TICK_MS: 1000,
     CRASHER_STEP: 0.1,
 
@@ -112,7 +112,9 @@ const CONFIG = {
     COUNTING_RESET_WAIT_MS: 4000,
 
     SAVE_MIN_INTERVAL_MS: 5000,
-    SAVE_DEBOUNCE_MS: 1500
+    SAVE_DEBOUNCE_MS: 1500,
+
+    MAX_BET: 1000000
 };
 
 let customRoles = [];
@@ -617,7 +619,7 @@ function resetCasinoUser(userId) { casino[userId] = { chips: 100, wins: 0, losse
 function buildCasinoPanelEmbed() {
     return new EmbedBuilder()
         .setTitle('Familie Snus Casino')
-        .setDescription('**Welkom in het casino!**\n\nIedereen begint met **100 chips**.\n\n**Games:**\n• `/blackjack <inzet>`\n• `/roulette <inzet> <kleur>`\n• `/crasher <inzet> [auto_cashout]`\n• `/balloon <inzet>`\n\n**Beloningen:**\n• Blackjack: 2x\n• Roulette rood/zwart: 2x\n• Roulette groen: 14x\n• Crasher: tot 25x (crash kan elk moment)\n• Balloon: tot 25x (10 stages, pomp of cash out)\n\n**Tip:** Bekijk je chips met `/chips`.')
+        .setDescription('**Welkom in het casino!**\n\nIedereen begint met **100 chips**.\n\n**Games:**\n• `/blackjack <inzet>` (max 1.000.000)\n• `/roulette <inzet> <kleur>` (max 1.000.000)\n• `/crasher <inzet> [auto_cashout]` (max 1.000.000)\n• `/balloon <inzet>` (max 1.000.000)\n\n**Beloningen:**\n• Blackjack: 2x\n• Roulette rood/zwart: 2x\n• Roulette groen: 14x\n• Crasher: tot 25x (crash kan elk moment)\n• Balloon: tot 25x (10 stages, pomp of cash out)\n\n**Tip:** Bekijk je chips met `/chips`.')
         .setColor(CASINO_GOLD).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 }
 
@@ -834,7 +836,7 @@ async function playRoulette(interaction, bet, choice) {
     await updateCasinoPanel();
 }
 
-// --- CRASHER (0.5 stappen, snel, zoals vroeger) ---
+// --- CRASHER ---
 function buildCrasherEmbed(game, multiplier, status, color) {
     return new EmbedBuilder()
         .setTitle('Crasher')
@@ -942,8 +944,7 @@ async function handleCrashCashout(interaction, gameId) {
     await updateCasinoPanel();
 }
 
-// --- BALLOON GAME (10 stages, pomp of cash out) ---
-const BALLOON_EMOJIS = ['🎈', '🎈', '🎈', '🎈', '🎈', '🎈', '🎈', '🎈', '🎈', '🎈'];
+// --- BALLOON GAME ---
 const BALLOON_POPPED = '💥';
 const BALLOON_CASHED = '💰';
 
@@ -962,7 +963,7 @@ function buildBalloonEmbed(game, phase = 'active') {
 
     let title, statusLine, color;
     if (phase === 'active') {
-        title = `${BALLOON_EMOJIS[Math.min(stageIdx, BALLOON_EMOJIS.length - 1)]} Balloon — Stage ${stageIdx}/10`;
+        title = `🎈 Balloon — Stage ${stageIdx}/10`;
         statusLine = stageIdx === 0
             ? 'Klik **Pump** om te beginnen, of **Cash Out** om te stoppen.'
             : `Volgende pump: **${nextMultiplier.toFixed(1)}x** (kans op knallen: **${(nextPopChance * 100).toFixed(0)}%**)`;
@@ -1059,7 +1060,6 @@ async function handleBalloonPump(interaction, gameId) {
     const u = getCasinoUser(game.userId);
 
     if (game.stage >= CONFIG.BALLOON_STAGES.length) {
-        // Max stage bereikt — auto cashout op 25x
         game.finished = true;
         balloonGames.delete(gameId);
         const finalMult = CONFIG.BALLOON_STAGES[CONFIG.BALLOON_STAGES.length - 1].multiplier;
@@ -1091,7 +1091,6 @@ async function handleBalloonCashout(interaction, gameId) {
     game.finished = true;
     balloonGames.delete(gameId);
 
-    // Als stage 0: geen winst (inzet was al afgetrokken, cashout op 1.0x = inzet terug)
     const currentMult = game.stage === 0 ? 1.00 : CONFIG.BALLOON_STAGES[game.stage - 1].multiplier;
     const winnings = Math.floor(game.bet * currentMult);
     const u = getCasinoUser(game.userId);
@@ -1348,6 +1347,7 @@ client.once('ready', async () => {
     if (guild) { updateStatus(guild); await setupCallCategory(guild).catch(() => {}); }
 
     try {
+        const MAX = CONFIG.MAX_BET;
         const commands = [
             new SlashCommandBuilder().setName('clear').setDescription('Verwijder berichten').addIntegerOption(o => o.setName('amount').setDescription('1-100').setRequired(true).setMinValue(1).setMaxValue(100)).setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
             new SlashCommandBuilder().setName('antinuke').setDescription('Anti-nuke aan/uit').addStringOption(o => o.setName('actie').setDescription('enable of disable').setRequired(true).addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' })),
@@ -1357,10 +1357,10 @@ client.once('ready', async () => {
             new SlashCommandBuilder().setName('loadbackup').setDescription('Laad backup').addStringOption(o => o.setName('id').setDescription('Backup ID').setRequired(true)),
             new SlashCommandBuilder().setName('giveaway').setDescription('Start giveaway').addStringOption(o => o.setName('prijs').setDescription('Prijs').setRequired(true)).addStringOption(o => o.setName('duur').setDescription('10s, 1u, 1d, 2d').setRequired(true)).addIntegerOption(o => o.setName('winnaars').setDescription('Aantal').setRequired(false).setMinValue(1).setMaxValue(10)),
             new SlashCommandBuilder().setName('resetgame').setDescription('Reset een spel').addStringOption(o => o.setName('game').setDescription('Welk spel?').setRequired(true).addChoices({ name: 'Tel Spel', value: 'counting' })),
-            new SlashCommandBuilder().setName('blackjack').setDescription('Speel blackjack').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(1000000)),
-            new SlashCommandBuilder().setName('roulette').setDescription('Speel roulette').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(1000000)).addStringOption(o => o.setName('kleur').setDescription('rood, zwart of groen').setRequired(true).addChoices({ name: 'rood', value: 'rood' }, { name: 'zwart', value: 'zwart' }, { name: 'groen', value: 'groen' })),
-            new SlashCommandBuilder().setName('crasher').setDescription('Speel crasher').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(1000000)).addNumberOption(o => o.setName('auto_cashout').setDescription('Optioneel: cash out op deze multiplier (1.1 - 25)').setRequired(false).setMinValue(1.1).setMaxValue(25)),
-            new SlashCommandBuilder().setName('balloon').setDescription('Speel de ballon game (10 stages, pomp of cash out)').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(1000000)),
+            new SlashCommandBuilder().setName('blackjack').setDescription('Speel blackjack').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(MAX)),
+            new SlashCommandBuilder().setName('roulette').setDescription('Speel roulette').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(MAX)).addStringOption(o => o.setName('kleur').setDescription('rood, zwart of groen').setRequired(true).addChoices({ name: 'rood', value: 'rood' }, { name: 'zwart', value: 'zwart' }, { name: 'groen', value: 'groen' })),
+            new SlashCommandBuilder().setName('crasher').setDescription('Speel crasher').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(MAX)).addNumberOption(o => o.setName('auto_cashout').setDescription('Optioneel: cash out op deze multiplier (1.1 - 25)').setRequired(false).setMinValue(1.1).setMaxValue(25)),
+            new SlashCommandBuilder().setName('balloon').setDescription('Speel de ballon game (10 stages, pomp of cash out)').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(MAX)),
             new SlashCommandBuilder().setName('chips').setDescription('Bekijk je chips'),
             new SlashCommandBuilder().setName('givechips').setDescription('Geef chips aan een gebruiker').addUserOption(o => o.setName('user').setDescription('Ontvanger').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Aantal chips').setRequired(true).setMinValue(1).setMaxValue(100000000))
         ].map(c => c.toJSON());
