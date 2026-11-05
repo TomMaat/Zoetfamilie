@@ -91,9 +91,23 @@ const CONFIG = {
 
     CASINO_EMBED_DELETE_AFTER_MS: 8000,
 
-    // CRASHER — 0.01 per tick, 1 stap per tick, embed update ELKE tick, iets sneller
-    CRASHER_TICK_MS: 250,
-    CRASHER_STEP: 0.01,
+    // CRASHER — terug naar 0.5 per tick, snel
+    CRASHER_TICK_MS: 600,
+    CRASHER_STEP: 0.5,
+
+    // BALLOON — 10 stages met oplopende multipliers
+    BALLOON_STAGES: [
+        { multiplier: 1.2, popChance: 0.10 },
+        { multiplier: 1.5, popChance: 0.15 },
+        { multiplier: 2.0, popChance: 0.20 },
+        { multiplier: 3.0, popChance: 0.30 },
+        { multiplier: 4.0, popChance: 0.40 },
+        { multiplier: 5.0, popChance: 0.50 },
+        { multiplier: 7.0, popChance: 0.60 },
+        { multiplier: 10.0, popChance: 0.70 },
+        { multiplier: 15.0, popChance: 0.80 },
+        { multiplier: 25.0, popChance: 0.90 }
+    ],
 
     COUNTING_RESET_WAIT_MS: 4000,
 
@@ -106,6 +120,7 @@ let giveaways = {};
 let countingState = {};
 let casino = {};
 let crashGames = new Map();
+let balloonGames = new Map();
 let blackjackGames = new Map();
 let casinoPanelMessageId = null;
 let casinoLeaderboardMessageId = null;
@@ -570,7 +585,6 @@ async function handleCountingMessage(message) {
             await channel.send({ content: errorText }).catch(() => {});
             await new Promise(r => setTimeout(r, CONFIG.COUNTING_RESET_WAIT_MS));
         } catch (e) {}
-
         state.current = 0;
         state.lastUserId = null;
         countingState[message.channel.id] = state;
@@ -603,7 +617,7 @@ function resetCasinoUser(userId) { casino[userId] = { chips: 100, wins: 0, losse
 function buildCasinoPanelEmbed() {
     return new EmbedBuilder()
         .setTitle('Familie Snus Casino')
-        .setDescription('**Welkom in het casino!**\n\nIedereen begint met **100 chips**.\n\n**Games:**\n• `/blackjack <inzet>`\n• `/roulette <inzet> <kleur>`\n• `/crasher <inzet> [auto_cashout]`\n\n**Beloningen:**\n• Blackjack: 2x\n• Roulette rood/zwart: 2x\n• Roulette groen: 14x\n• Crasher: tot 25x (crash kan elk moment)\n\n**Tip:** Bekijk je chips met `/chips`.')
+        .setDescription('**Welkom in het casino!**\n\nIedereen begint met **100 chips**.\n\n**Games:**\n• `/blackjack <inzet>`\n• `/roulette <inzet> <kleur>`\n• `/crasher <inzet> [auto_cashout]`\n• `/balloon <inzet>`\n\n**Beloningen:**\n• Blackjack: 2x\n• Roulette rood/zwart: 2x\n• Roulette groen: 14x\n• Crasher: tot 25x (crash kan elk moment)\n• Balloon: tot 25x (10 stages, pomp of cash out)\n\n**Tip:** Bekijk je chips met `/chips`.')
         .setColor(CASINO_GOLD).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 }
 
@@ -820,52 +834,11 @@ async function playRoulette(interaction, bet, choice) {
     await updateCasinoPanel();
 }
 
-// --- CRASHER (ballon animatie) ---
-// Ballon groeit visueel met multiplier: hoe hoger, hoe meer opgeblazen
-function buildBalloon(multiplier) {
-    // 1.00x = klein, 25.00x = heel groot
-    const progress = Math.min(1, (multiplier - 1) / 24);
-    const stages = [
-        '🎈',       // begin
-        '🎈',       // klein
-        '🎈',       // groter
-        '🎈',       // groter
-        '🎈',       // bijna knappen
-        '🎈'        // op knappen
-    ];
-    const idx = Math.floor(progress * (stages.length - 1));
-    return stages[idx];
-}
-
-// Ballon-grootte indicator (streepjes) om groei te tonen
-function buildBalloonBar(multiplier) {
-    const progress = Math.min(1, (multiplier - 1) / 24);
-    const filled = Math.round(progress * 20);
-    const empty = 20 - filled;
-    const bar = '█'.repeat(filled) + '░'.repeat(empty);
-    return `\`${bar}\``;
-}
-
-function buildCrasherEmbed(game, multiplier, status, color, phase = 'active') {
-    const balloon = buildBalloon(multiplier);
-    const bar = buildBalloonBar(multiplier);
-    let stateLine;
-
-    if (phase === 'active') {
-        stateLine = `${balloon} **Ballon groeit...**`;
-    } else if (phase === 'popped') {
-        stateLine = `💥 **BALON GEKNALT!**`;
-    } else if (phase === 'cashed') {
-        stateLine = `💰 **Ballon veilig leeggelaten**`;
-    } else {
-        stateLine = '';
-    }
-
+// --- CRASHER (0.5 stappen, snel, zoals vroeger) ---
+function buildCrasherEmbed(game, multiplier, status, color) {
     return new EmbedBuilder()
         .setTitle('Crasher')
         .setDescription(
-            `${stateLine}\n\n` +
-            `${bar}\n\n` +
             `**Inzet:** ${game.bet} chips\n` +
             `**Huidige multiplier:** **${multiplier.toFixed(2)}x**\n` +
             `**Mogelijke winst:** ${Math.floor(game.bet * multiplier)} chips\n` +
@@ -875,7 +848,6 @@ function buildCrasherEmbed(game, multiplier, status, color, phase = 'active') {
         .setColor(color || (multiplier >= 3 ? CASINO_GREEN : multiplier >= 2 ? CASINO_GOLD : PURPLE.main))
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 }
-
 function buildCrasherRows(gameId, active) {
     if (!active) return [];
     return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`crash_cashout_${gameId}`).setLabel('Cash Out').setStyle(ButtonStyle.Success))];
@@ -897,12 +869,12 @@ async function playCrasher(interaction, bet, autoCashout = null) {
     await saveToGist();
 
     const gameId = `${interaction.user.id}_${Date.now()}`;
-    const crashPoint = (Math.random() * 23.8) + 1.2;
+    const crashPoint = (Math.random() * 23.5) + 1.5;
     const game = { userId: interaction.user.id, bet, multiplier: 1.00, crashPoint, autoCashout, finished: false, interval: null };
     crashGames.set(gameId, game);
 
     await interaction.reply({
-        embeds: [buildCrasherEmbed(game, 1.00, 'Klik op **Cash Out** voordat de ballon knalt!', null, 'active')],
+        embeds: [buildCrasherEmbed(game, 1.00, 'Klik op **Cash Out** voordat de multiplier crasht!')],
         components: buildCrasherRows(gameId, true)
     });
 
@@ -910,11 +882,8 @@ async function playCrasher(interaction, bet, autoCashout = null) {
 
     game.interval = setInterval(async () => {
         if (game.finished) { clearInterval(game.interval); return; }
-
-        // 1 stap van 0.01 per tick — geen sprongen, geen vastlopers
         game.multiplier = Math.round((game.multiplier + CONFIG.CRASHER_STEP) * 100) / 100;
 
-        // Auto cashout check
         if (game.autoCashout !== null && game.multiplier >= game.autoCashout && game.multiplier < game.crashPoint) {
             game.finished = true;
             clearInterval(game.interval);
@@ -925,7 +894,7 @@ async function playCrasher(interaction, bet, autoCashout = null) {
             u.wins += 1;
             u.gamesPlayed += 1;
             await saveToGist();
-            const finalEmbed = buildCrasherEmbed(game, game.autoCashout, `**Auto Cash Out!** Je wint **${winnings} chips** op **${game.autoCashout.toFixed(2)}x**!`, CASINO_GREEN, 'cashed');
+            const finalEmbed = buildCrasherEmbed(game, game.autoCashout, `**Auto Cash Out!** Je wint **${winnings} chips** op **${game.autoCashout.toFixed(2)}x**!`, CASINO_GREEN);
             await message.edit({ embeds: [finalEmbed], components: [] }).catch(() => {});
             scheduleDelete(message, CONFIG.CASINO_EMBED_DELETE_AFTER_MS);
             await updateCasinoLeaderboard();
@@ -933,7 +902,6 @@ async function playCrasher(interaction, bet, autoCashout = null) {
             return;
         }
 
-        // Crash check
         if (game.multiplier >= game.crashPoint || game.multiplier >= 25) {
             game.finished = true;
             clearInterval(game.interval);
@@ -942,7 +910,7 @@ async function playCrasher(interaction, bet, autoCashout = null) {
             u.losses += 1;
             u.gamesPlayed += 1;
             await saveToGist();
-            const finalEmbed = buildCrasherEmbed(game, game.multiplier, `De multiplier klapte op **${game.crashPoint.toFixed(2)}x**. Je verliest **${game.bet} chips**.`, CASINO_RED, 'popped');
+            const finalEmbed = buildCrasherEmbed(game, game.multiplier, `**CRASH!** De multiplier klapte op **${game.crashPoint.toFixed(2)}x**. Je verliest **${game.bet} chips**.`, CASINO_RED);
             await message.edit({ embeds: [finalEmbed], components: [] }).catch(() => {});
             scheduleDelete(message, CONFIG.CASINO_EMBED_DELETE_AFTER_MS);
             await updateCasinoLeaderboard();
@@ -950,11 +918,7 @@ async function playCrasher(interaction, bet, autoCashout = null) {
             return;
         }
 
-        // Update embed ELKE tick — geen sprongen
-        await message.edit({
-            embeds: [buildCrasherEmbed(game, game.multiplier, 'Klik op **Cash Out** voordat de ballon knalt!', null, 'active')],
-            components: buildCrasherRows(gameId, true)
-        }).catch(() => {});
+        await message.edit({ embeds: [buildCrasherEmbed(game, game.multiplier, 'Klik op **Cash Out** voordat de multiplier crasht!')], components: buildCrasherRows(gameId, true) }).catch(() => {});
     }, CONFIG.CRASHER_TICK_MS);
 }
 
@@ -971,8 +935,173 @@ async function handleCrashCashout(interaction, gameId) {
     u.wins += 1;
     u.gamesPlayed += 1;
     await saveToGist();
-    const finalEmbed = buildCrasherEmbed(game, game.multiplier, `**Cash Out!** Je wint **${winnings} chips** op **${game.multiplier.toFixed(2)}x**!`, CASINO_GREEN, 'cashed');
+    const finalEmbed = buildCrasherEmbed(game, game.multiplier, `**Cash Out!** Je wint **${winnings} chips** op **${game.multiplier.toFixed(2)}x**!`, CASINO_GREEN);
     await interaction.update({ embeds: [finalEmbed], components: [] });
+    scheduleDelete(await interaction.fetchReply().catch(() => null), CONFIG.CASINO_EMBED_DELETE_AFTER_MS);
+    await updateCasinoLeaderboard();
+    await updateCasinoPanel();
+}
+
+// --- BALLOON GAME (10 stages, pomp of cash out) ---
+const BALLOON_EMOJIS = ['🎈', '🎈', '🎈', '🎈', '🎈', '🎈', '🎈', '🎈', '🎈', '🎈'];
+const BALLOON_POPPED = '💥';
+const BALLOON_CASHED = '💰';
+
+function buildBalloonBar(stage) {
+    const filled = stage;
+    const empty = CONFIG.BALLOON_STAGES.length - stage;
+    return '█'.repeat(Math.max(0, filled)) + '░'.repeat(Math.max(0, empty));
+}
+
+function buildBalloonEmbed(game, phase = 'active') {
+    const stageIdx = game.stage;
+    const stage = CONFIG.BALLOON_STAGES[stageIdx];
+    const currentMultiplier = game.stage === 0 ? 1.00 : CONFIG.BALLOON_STAGES[game.stage - 1].multiplier;
+    const nextMultiplier = stage ? stage.multiplier : null;
+    const nextPopChance = stage ? stage.popChance : null;
+
+    let title, statusLine, color;
+    if (phase === 'active') {
+        title = `${BALLOON_EMOJIS[Math.min(stageIdx, BALLOON_EMOJIS.length - 1)]} Balloon — Stage ${stageIdx}/10`;
+        statusLine = stageIdx === 0
+            ? 'Klik **Pump** om te beginnen, of **Cash Out** om te stoppen.'
+            : `Volgende pump: **${nextMultiplier.toFixed(1)}x** (kans op knallen: **${(nextPopChance * 100).toFixed(0)}%**)`;
+        color = stageIdx >= 7 ? CASINO_RED : stageIdx >= 4 ? CASINO_GOLD : PURPLE.main;
+    } else if (phase === 'popped') {
+        title = `${BALLOON_POPPED} BALLOON GEKNALT!`;
+        statusLine = `De ballon knalde op stage **${stageIdx}**. Je verliest **${game.bet} chips**.`;
+        color = CASINO_RED;
+    } else {
+        title = `${BALLOON_CASHED} Balloon — Cash Out`;
+        statusLine = `Je bent veilig gestopt op stage **${stageIdx}** met **${currentMultiplier.toFixed(1)}x**!`;
+        color = CASINO_GREEN;
+    }
+
+    const bar = buildBalloonBar(stageIdx);
+    const currentWin = Math.floor(game.bet * currentMultiplier);
+
+    return new EmbedBuilder()
+        .setTitle(title)
+        .setColor(color)
+        .setDescription(
+            `${bar}\n\n` +
+            `**Huidige multiplier:** **${currentMultiplier.toFixed(1)}x**\n` +
+            `**Huidige winst:** ${currentWin} chips\n` +
+            `**Inzet:** ${game.bet} chips\n` +
+            (phase === 'active' ? `\n${statusLine}\n\n**Stages:**\n${CONFIG.BALLOON_STAGES.map((s, i) => {
+                const mark = i < stageIdx ? '✅' : i === stageIdx ? '👉' : '⬜';
+                return `${mark} ${i + 1}. ${s.multiplier.toFixed(1)}x (${(s.popChance * 100).toFixed(0)}% kans)`;
+            }).join('\n')}` : `\n${statusLine}`)
+        )
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
+}
+
+function buildBalloonRows(gameId, active) {
+    if (!active) return [];
+    const stageIdx = balloonGames.get(gameId)?.stage || 0;
+    const atMax = stageIdx >= CONFIG.BALLOON_STAGES.length;
+    if (atMax) return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`balloon_cashout_${gameId}`).setLabel('Cash Out').setStyle(ButtonStyle.Success))];
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`balloon_pump_${gameId}`).setLabel(`Pump (stage ${stageIdx + 1})`).setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`balloon_cashout_${gameId}`).setLabel('Cash Out').setStyle(ButtonStyle.Success)
+    )];
+}
+
+async function playBalloon(interaction, bet) {
+    const user = getCasinoUser(interaction.user.id);
+    if (user.chips <= 0) {
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setStyle(ButtonStyle.Success));
+        return interaction.reply({ content: 'Je hebt 0 chips. Reset naar 100 chips.', components: [row], flags: MessageFlags.Ephemeral });
+    }
+    if (bet < 1) return interaction.reply({ content: 'Minstens 1 chip.', flags: MessageFlags.Ephemeral });
+    if (bet > user.chips) return interaction.reply({ content: `Je hebt maar ${user.chips} chips.`, flags: MessageFlags.Ephemeral });
+
+    user.chips -= bet;
+    await saveToGist();
+
+    const gameId = `${interaction.user.id}_${Date.now()}`;
+    const game = { userId: interaction.user.id, bet, stage: 0, finished: false };
+    balloonGames.set(gameId, game);
+
+    await interaction.reply({
+        embeds: [buildBalloonEmbed(game, 'active')],
+        components: buildBalloonRows(gameId, true)
+    });
+}
+
+async function handleBalloonPump(interaction, gameId) {
+    const game = balloonGames.get(gameId);
+    if (!game) return interaction.reply({ content: 'Deze game is verlopen.', flags: MessageFlags.Ephemeral });
+    if (game.userId !== interaction.user.id) return interaction.reply({ content: 'Dit is niet jouw game.', flags: MessageFlags.Ephemeral });
+    if (game.finished) return interaction.reply({ content: 'Deze game is al klaar.', flags: MessageFlags.Ephemeral });
+    if (game.stage >= CONFIG.BALLOON_STAGES.length) return interaction.reply({ content: 'Max stage bereikt! Cash out nu.', flags: MessageFlags.Ephemeral });
+
+    const nextStage = CONFIG.BALLOON_STAGES[game.stage];
+    const popChance = nextStage.popChance;
+    const popped = Math.random() < popChance;
+
+    if (popped) {
+        game.finished = true;
+        balloonGames.delete(gameId);
+        const u = getCasinoUser(game.userId);
+        u.losses += 1;
+        u.gamesPlayed += 1;
+        await saveToGist();
+        const embed = buildBalloonEmbed(game, 'popped');
+        await interaction.update({ embeds: [embed], components: [] });
+        scheduleDelete(await interaction.fetchReply().catch(() => null), CONFIG.CASINO_EMBED_DELETE_AFTER_MS);
+        await updateCasinoLeaderboard();
+        await updateCasinoPanel();
+        return;
+    }
+
+    game.stage += 1;
+    const u = getCasinoUser(game.userId);
+
+    if (game.stage >= CONFIG.BALLOON_STAGES.length) {
+        // Max stage bereikt — auto cashout op 25x
+        game.finished = true;
+        balloonGames.delete(gameId);
+        const finalMult = CONFIG.BALLOON_STAGES[CONFIG.BALLOON_STAGES.length - 1].multiplier;
+        const winnings = Math.floor(game.bet * finalMult);
+        u.chips += winnings;
+        u.wins += 1;
+        u.gamesPlayed += 1;
+        await saveToGist();
+        const embed = buildBalloonEmbed(game, 'cashed');
+        await interaction.update({ embeds: [embed], components: [] });
+        scheduleDelete(await interaction.fetchReply().catch(() => null), CONFIG.CASINO_EMBED_DELETE_AFTER_MS);
+        await updateCasinoLeaderboard();
+        await updateCasinoPanel();
+        return;
+    }
+
+    await interaction.update({
+        embeds: [buildBalloonEmbed(game, 'active')],
+        components: buildBalloonRows(gameId, true)
+    });
+}
+
+async function handleBalloonCashout(interaction, gameId) {
+    const game = balloonGames.get(gameId);
+    if (!game) return interaction.reply({ content: 'Deze game is verlopen.', flags: MessageFlags.Ephemeral });
+    if (game.userId !== interaction.user.id) return interaction.reply({ content: 'Dit is niet jouw game.', flags: MessageFlags.Ephemeral });
+    if (game.finished) return interaction.reply({ content: 'Deze game is al klaar.', flags: MessageFlags.Ephemeral });
+
+    game.finished = true;
+    balloonGames.delete(gameId);
+
+    // Als stage 0: geen winst (inzet was al afgetrokken, cashout op 1.0x = inzet terug)
+    const currentMult = game.stage === 0 ? 1.00 : CONFIG.BALLOON_STAGES[game.stage - 1].multiplier;
+    const winnings = Math.floor(game.bet * currentMult);
+    const u = getCasinoUser(game.userId);
+    u.chips += winnings;
+    if (currentMult > 1) u.wins += 1;
+    u.gamesPlayed += 1;
+    await saveToGist();
+
+    const embed = buildBalloonEmbed(game, 'cashed');
+    await interaction.update({ embeds: [embed], components: [] });
     scheduleDelete(await interaction.fetchReply().catch(() => null), CONFIG.CASINO_EMBED_DELETE_AFTER_MS);
     await updateCasinoLeaderboard();
     await updateCasinoPanel();
@@ -1231,6 +1360,7 @@ client.once('ready', async () => {
             new SlashCommandBuilder().setName('blackjack').setDescription('Speel blackjack').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)),
             new SlashCommandBuilder().setName('roulette').setDescription('Speel roulette').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)).addStringOption(o => o.setName('kleur').setDescription('rood, zwart of groen').setRequired(true).addChoices({ name: 'rood', value: 'rood' }, { name: 'zwart', value: 'zwart' }, { name: 'groen', value: 'groen' })),
             new SlashCommandBuilder().setName('crasher').setDescription('Speel crasher').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)).addNumberOption(o => o.setName('auto_cashout').setDescription('Optioneel: cash out op deze multiplier (1.1 - 25)').setRequired(false).setMinValue(1.1).setMaxValue(25)),
+            new SlashCommandBuilder().setName('balloon').setDescription('Speel de ballon game (10 stages, pomp of cash out)').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)),
             new SlashCommandBuilder().setName('chips').setDescription('Bekijk je chips'),
             new SlashCommandBuilder().setName('givechips').setDescription('Geef chips aan een gebruiker').addUserOption(o => o.setName('user').setDescription('Ontvanger').setRequired(true)).addIntegerOption(o => o.setName('amount').setDescription('Aantal chips').setRequired(true).setMinValue(1).setMaxValue(1000000))
         ].map(c => c.toJSON());
@@ -1486,6 +1616,7 @@ client.on('interactionCreate', async (interaction) => {
             const auto = interaction.options.getNumber('auto_cashout');
             return playCrasher(interaction, bet, auto === null ? null : auto);
         }
+        if (interaction.commandName === 'balloon') return playBalloon(interaction, interaction.options.getInteger('inzet'));
 
         if (interaction.commandName === 'clear') {
             if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
@@ -1720,6 +1851,8 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.customId.startsWith('bj_hit_')) return handleBjHit(interaction, interaction.customId.replace('bj_hit_', ''));
     if (interaction.customId.startsWith('bj_stand_')) return handleBjStand(interaction, interaction.customId.replace('bj_stand_', ''));
     if (interaction.customId.startsWith('crash_cashout_')) return handleCrashCashout(interaction, interaction.customId.replace('crash_cashout_', ''));
+    if (interaction.customId.startsWith('balloon_pump_')) return handleBalloonPump(interaction, interaction.customId.replace('balloon_pump_', ''));
+    if (interaction.customId.startsWith('balloon_cashout_')) return handleBalloonCashout(interaction, interaction.customId.replace('balloon_cashout_', ''));
 
     if (interaction.customId.startsWith('gw_join_') || (interaction.customId.startsWith('gw_reroll_') && !interaction.customId.startsWith('gw_reroll_old_') && !interaction.customId.startsWith('gw_reroll_new_'))) return handleGiveawayButton(interaction);
 
