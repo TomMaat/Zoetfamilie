@@ -90,8 +90,11 @@ const CONFIG = {
     CHIP_GIVER_ID: '1033753872927293520',
 
     CASINO_EMBED_DELETE_AFTER_MS: 8000,
-    CRASHER_TICK_MS: 1200,
-    CRASHER_EDIT_EVERY_N_TICKS: 2
+    CRASHER_TICK_MS: 400,
+    CRASHER_STEP: 0.01,
+    CRASHER_EDIT_EVERY_N_TICKS: 5,
+
+    COUNTING_RESET_WAIT_MS: 4000
 };
 
 let customRoles = [];
@@ -322,7 +325,6 @@ async function sendLog(guild, channelId, { title, description, color, thumbnail 
     } catch (err) {}
 }
 
-// Verwijdert een bericht na X ms (voor casino result embeds)
 function scheduleDelete(message, ms = CONFIG.CASINO_EMBED_DELETE_AFTER_MS) {
     if (!message) return;
     setTimeout(() => { message.delete().catch(() => {}); }, ms);
@@ -513,26 +515,47 @@ async function updateCountingEmbed(state) {
 async function handleCountingMessage(message) {
     if (message.author.bot) return;
     if (message.channel.id !== CONFIG.COUNTING_CHANNEL_ID) return;
+
     const state = countingState[message.channel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
     const match = message.content.trim().match(/^(\d+)$/);
-    const reset = async (msg) => {
-        state.current = 0; state.lastUserId = null;
+
+    // Reset: eerst foutmelding tonen, wachten, dan pas wissen + nieuwe embed
+    const reset = async (errorText) => {
+        try {
+            const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID);
+            await channel.send({ content: errorText }).catch(() => {});
+            await new Promise(r => setTimeout(r, CONFIG.COUNTING_RESET_WAIT_MS));
+        } catch (e) {}
+
+        state.current = 0;
+        state.lastUserId = null;
         countingState[message.channel.id] = state;
         await saveToGist();
-        const newId = await resetCountingChannel(state);
-        if (newId) {
-            try { const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID); await channel.send({ content: msg }).catch(() => {}); } catch (e) {}
-        }
+        await resetCountingChannel(state);
     };
-    if (!match) return reset(`${message.author} - Geen geldig getal. Opnieuw bij **1**.`);
+
+    if (!match) {
+        return reset(`❌ ${message.author} - Geen geldig getal. Het spel begint opnieuw bij **1**.`);
+    }
+
     const typed = parseInt(match[1], 10);
-    if (state.lastUserId === message.author.id) return reset(`${message.author} - Niet 2x achter elkaar. Opnieuw bij **1**.`);
-    if (typed !== state.current + 1) return reset(`${message.author} - Fout! Je moest **${state.current + 1}** typen. Opnieuw bij **1**.`);
+
+    if (state.lastUserId === message.author.id) {
+        return reset(`❌ ${message.author} - Je mag niet 2x achter elkaar typen. Het spel begint opnieuw bij **1**.`);
+    }
+
+    if (typed !== state.current + 1) {
+        return reset(`❌ ${message.author} - Fout! Je moest **${state.current + 1}** typen. Het spel begint opnieuw bij **1**.`);
+    }
+
+    // Geldige zet: ✅ reactie, stand ophogen, embed update
     state.current = typed;
     state.lastUserId = message.author.id;
     if (state.current > (state.highScore || 0)) state.highScore = state.current;
     countingState[message.channel.id] = state;
     await saveToGist();
+
+    await message.react('✅').catch(() => {});
     await updateCountingEmbed(state);
 }
 
@@ -763,7 +786,7 @@ async function playRoulette(interaction, bet, choice) {
     await updateCasinoPanel();
 }
 
-// --- CRASHER (geoptimaliseerd + auto cashout) ---
+// --- CRASHER ---
 function buildCrasherEmbed(game, multiplier, status, color) {
     return new EmbedBuilder()
         .setTitle('Crasher')
@@ -811,10 +834,10 @@ async function playCrasher(interaction, bet, autoCashout = null) {
 
     game.interval = setInterval(async () => {
         if (game.finished) { clearInterval(game.interval); return; }
-        game.multiplier += 0.1;
+        game.multiplier += CONFIG.CRASHER_STEP;
+        game.multiplier = Math.round(game.multiplier * 100) / 100;
         game.tick++;
 
-        // Auto cashout check
         if (game.autoCashout !== null && game.multiplier >= game.autoCashout && game.multiplier < game.crashPoint) {
             game.finished = true;
             clearInterval(game.interval);
@@ -833,7 +856,6 @@ async function playCrasher(interaction, bet, autoCashout = null) {
             return;
         }
 
-        // Crash
         if (game.multiplier >= game.crashPoint || game.multiplier >= 25) {
             game.finished = true;
             clearInterval(game.interval);
@@ -850,7 +872,6 @@ async function playCrasher(interaction, bet, autoCashout = null) {
             return;
         }
 
-        // Tussentijdse update: alleen elke N ticks om rate limit te voorkomen
         if (game.tick % CONFIG.CRASHER_EDIT_EVERY_N_TICKS === 0) {
             await message.edit({ embeds: [buildCrasherEmbed(game, game.multiplier, 'Klik op **Cash Out** voordat de multiplier crasht!')], components: buildCrasherRows(gameId, true) }).catch(() => {});
         }
@@ -1117,7 +1138,6 @@ client.once('ready', async () => {
     const guild = client.guilds.cache.first();
     if (guild) { updateStatus(guild); await setupCallCategory(guild).catch(() => {}); }
 
-    // Commands EERST registreren (kritiek)
     try {
         const commands = [
             new SlashCommandBuilder().setName('clear').setDescription('Verwijder berichten').addIntegerOption(o => o.setName('amount').setDescription('1-100').setRequired(true).setMinValue(1).setMaxValue(100)).setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
@@ -1141,7 +1161,6 @@ client.once('ready', async () => {
         console.log('Slash commands geregistreerd');
     } catch (err) { console.error('Fout bij registreren commands:', err); }
 
-    // Panels — elk in eigen try/catch zodat één fout de rest niet blokkeert
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
@@ -1353,14 +1372,12 @@ async function checkEmptyCalls() {
 client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isChatInputCommand()) {
-        // CHIPS
         if (interaction.commandName === 'chips') {
             const u = getCasinoUser(interaction.user.id);
             const embed = new EmbedBuilder().setTitle('🪙 Jouw chips').setDescription(`**Chips:** ${u.chips}\n**Wins:** ${u.wins}\n**Losses:** ${u.losses}\n**Games:** ${u.gamesPlayed}`).setColor(CASINO_GOLD).setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 })).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
             return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
         }
 
-        // GIVECHIPS
         if (interaction.commandName === 'givechips') {
             if (interaction.user.id !== CONFIG.CHIP_GIVER_ID) {
                 return interaction.reply({ content: '❌ Geen toestemming.', flags: MessageFlags.Ephemeral });
@@ -1382,7 +1399,6 @@ client.on('interactionCreate', async (interaction) => {
             return interaction.reply({ embeds: [embed] });
         }
 
-        // CASINO
         if (interaction.commandName === 'blackjack') return playBlackjack(interaction, interaction.options.getInteger('inzet'));
         if (interaction.commandName === 'roulette') return playRoulette(interaction, interaction.options.getInteger('inzet'), interaction.options.getString('kleur'));
         if (interaction.commandName === 'crasher') {
@@ -1391,7 +1407,6 @@ client.on('interactionCreate', async (interaction) => {
             return playCrasher(interaction, bet, auto === null ? null : auto);
         }
 
-        // MODERATIE
         if (interaction.commandName === 'clear') {
             if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             const amount = interaction.options.getInteger('amount');
