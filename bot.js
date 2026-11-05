@@ -733,19 +733,73 @@ async function handleAntiLink(message) {
 }
 
 // --- COUNTING GAME ---
+function buildCountingEmbed(state) {
+    const current = state?.current || 0;
+    const highScore = state?.highScore || 0;
+    return new EmbedBuilder()
+        .setTitle('🔢 Tel-spel')
+        .setDescription(
+            `**Huidige stand:** ${current}\n` +
+            `**Highscore:** ${highScore}\n\n` +
+            '**Regels:**\n' +
+            '• Typ het juiste volgende getal.\n' +
+            '• Je mag niet 2x achter elkaar typen.\n' +
+            '• Typ je iets anders of fout, dan begint het spel opnieuw bij 1.'
+        )
+        .setColor(PURPLE.main)
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
+}
+
+async function updateCountingEmbed(state) {
+    try {
+        const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID).catch(() => null);
+        if (!channel) return;
+        const payload = buildCountingEmbed(state);
+
+        if (state.lastMessageId) {
+            try {
+                const msg = await channel.messages.fetch(state.lastMessageId);
+                await msg.edit(payload);
+                return;
+            } catch (e) {
+                state.lastMessageId = null;
+            }
+        }
+
+        try {
+            const fetched = await channel.messages.fetch({ limit: 20 });
+            const botMessages = fetched.filter(m => m.author.id === client.user.id);
+            for (const m of botMessages.values()) {
+                await m.delete().catch(() => {});
+            }
+        } catch (e) {}
+
+        const sent = await channel.send(payload);
+        state.lastMessageId = sent.id;
+        countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
+    } catch (err) {
+        console.error('Fout bij updaten tel-embed:', err);
+    }
+}
+
 async function handleCountingMessage(message) {
     if (message.author.bot) return;
     if (message.channel.id !== CONFIG.COUNTING_CHANNEL_ID) return;
 
-    const state = countingState[message.channel.id] || { current: 0, lastUserId: null };
+    const state = countingState[message.channel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
 
     const content = message.content.trim();
     const numberMatch = content.match(/^(\d+)$/);
 
     if (!numberMatch) {
         await message.delete().catch(() => {});
-        countingState[message.channel.id] = { current: 0, lastUserId: null };
+        state.current = 0;
+        state.lastUserId = null;
+        countingState[message.channel.id] = state;
         await saveToGist();
+        await updateCountingEmbed(state);
         await message.channel.send({
             content: `${message.author} - Dat is geen geldig getal. Het spel begint opnieuw bij **1**.`
         }).catch(() => {});
@@ -756,8 +810,11 @@ async function handleCountingMessage(message) {
 
     if (state.lastUserId === message.author.id) {
         await message.delete().catch(() => {});
-        countingState[message.channel.id] = { current: 0, lastUserId: null };
+        state.current = 0;
+        state.lastUserId = null;
+        countingState[message.channel.id] = state;
         await saveToGist();
+        await updateCountingEmbed(state);
         await message.channel.send({
             content: `${message.author} - Je mag niet 2x achter elkaar. Het spel begint opnieuw bij **1**.`
         }).catch(() => {});
@@ -766,19 +823,27 @@ async function handleCountingMessage(message) {
 
     if (typedNumber !== state.current + 1) {
         await message.react('❌').catch(() => {});
-        countingState[message.channel.id] = { current: 0, lastUserId: null };
+        const expected = state.current + 1;
+        state.current = 0;
+        state.lastUserId = null;
+        countingState[message.channel.id] = state;
         await saveToGist();
+        await updateCountingEmbed(state);
         await message.channel.send({
-            content: `${message.author} - Fout! Je moest **${state.current + 1}** typen. Het spel begint opnieuw bij **1**.`
+            content: `${message.author} - Fout! Je moest **${expected}** typen. Het spel begint opnieuw bij **1**.`
         }).catch(() => {});
         return;
     }
 
     state.current = typedNumber;
     state.lastUserId = message.author.id;
+    if (state.current > (state.highScore || 0)) {
+        state.highScore = state.current;
+    }
     countingState[message.channel.id] = state;
     await saveToGist();
     await message.react('✅').catch(() => {});
+    await updateCountingEmbed(state);
 }
 
 // --- CALL PANEL ---
@@ -1523,6 +1588,17 @@ client.once('clientReady', async () => {
                         .setRequired(false)
                         .setMinValue(1)
                         .setMaxValue(10)
+                ),
+            new SlashCommandBuilder()
+                .setName('resetgame')
+                .setDescription('Reset de huidige stand van een spel (highscore blijft bewaard)')
+                .addStringOption(opt =>
+                    opt.setName('game')
+                        .setDescription('Welk spel wil je resetten?')
+                        .setRequired(true)
+                        .addChoices(
+                            { name: 'Tel Spel', value: 'counting' }
+                        )
                 )
         ].map(c => c.toJSON());
         await client.application.commands.set(commands);
@@ -1609,23 +1685,14 @@ client.once('clientReady', async () => {
     try {
         const countingChannel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID);
         if (countingChannel) {
-            const current = countingState[countingChannel.id]?.current || 0;
-            const embed = new EmbedBuilder()
-                .setTitle('🔢 Tel-spel')
-                .setDescription(
-                    'Typ de getallen in volgorde: **1, 2, 3, 4, ...**\n\n' +
-                    '**Regels:**\n' +
-                    '• Je moet het juiste volgende getal typen.\n' +
-                    '• Je mag niet 2x achter elkaar typen.\n' +
-                    '• Typ je iets anders, dan begint het spel opnieuw bij 1.\n\n' +
-                    `**Huidige stand:** ${current}`
-                )
-                .setColor(PURPLE.main)
-                .setThumbnail(CONFIG.LOGO_URL)
-                .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-                .setTimestamp();
-            await countingChannel.send({ embeds: [embed] }).catch(() => {});
-            console.log(`Tel-spel paneel gestuurd (stand: ${current})`);
+            const state = countingState[countingChannel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
+            if (!state.highScore) state.highScore = 0;
+            const sent = await countingChannel.send(buildCountingEmbed(state)).catch(() => null);
+            if (sent) {
+                state.lastMessageId = sent.id;
+                countingState[countingChannel.id] = state;
+            }
+            console.log(`Tel-spel paneel gestuurd (stand: ${state.current}, highscore: ${state.highScore})`);
         }
     } catch (err) {
         console.error('Fout bij tel-spel paneel:', err);
@@ -2239,6 +2306,34 @@ client.on('interactionCreate', async (interaction) => {
                 console.error('Fout bij giveaway:', err);
                 await interaction.editReply({ content: `❌ Kon giveaway niet starten: ${err.message}` });
             }
+        }
+
+        if (interaction.commandName === 'resetgame') {
+            const game = interaction.options.getString('game');
+
+            if (game === 'counting') {
+                if (!isCustomRoleManager(interaction)) {
+                    return interaction.reply({ content: 'Je hebt geen toestemming om dit te doen.', flags: MessageFlags.Ephemeral });
+                }
+
+                await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+                const state = countingState[CONFIG.COUNTING_CHANNEL_ID] || {
+                    current: 0,
+                    lastUserId: null,
+                    highScore: 0,
+                    lastMessageId: null
+                };
+                state.current = 0;
+                state.lastUserId = null;
+                countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
+                await saveToGist();
+                await updateCountingEmbed(state);
+
+                return interaction.editReply({ content: '✅ Tel-spel is gereset. De highscore blijft bewaard.' });
+            }
+
+            return interaction.reply({ content: '❌ Onbekend spel.', flags: MessageFlags.Ephemeral });
         }
         return;
     }
