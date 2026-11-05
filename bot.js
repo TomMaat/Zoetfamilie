@@ -92,7 +92,7 @@ const CONFIG = {
     CASINO_EMBED_DELETE_AFTER_MS: 8000,
 
     // CRASHER — terug naar 0.5 per tick, snel
-    CRASHER_TICK_MS: 1500,
+    CRASHER_TICK_MS: 600,
     CRASHER_STEP: 0.05,
 
     // BALLOON — 10 stages met oplopende multipliers
