@@ -38,6 +38,10 @@ const PURPLE = {
     soft: '#d2b4de'
 };
 
+const CASINO_GREEN = '#2ecc71';
+const CASINO_RED = '#e74c3c';
+const CASINO_GOLD = '#f1c40f';
+
 const CONFIG = {
     TOKEN: process.env.DISCORD_TOKEN,
     GITHUB_TOKEN: process.env.GITHUB_TOKEN,
@@ -72,6 +76,9 @@ const CONFIG = {
     ROLE_MANAGER_LOG_ID: '1567664373739163698',
 
     COUNTING_CHANNEL_ID: '1567857095989264485',
+
+    CASINO_CHANNEL_ID: '1567863335620321401',
+    CASINO_LEADERBOARD_CHANNEL_ID: '1567863557524033568',
 
     CUSTOM_ROLE_MANAGER_ROLE_ID: '1567237645057261689',
     GIVEAWAY_MANAGER_ROLE_ID: '1567237645057261689',
@@ -120,6 +127,9 @@ const DEFAULT_CUSTOM_ROLES = [
 let customRoles = [];
 let giveaways = {};
 let countingState = {};
+let casino = {}; // userId -> { chips, wins, losses, gamesPlayed }
+let casinoPanelMessageId = null;
+let casinoLeaderboardMessageId = null;
 
 const GIST_FILE = 'zoet.json';
 let gistId = CONFIG.GIST_ID;
@@ -172,7 +182,8 @@ async function initGist() {
                             customRoles: DEFAULT_CUSTOM_ROLES.map((r, i) => ({ ...r, order: i })),
                             backups: {},
                             giveaways: {},
-                            countingState: {}
+                            countingState: {},
+                            casino: {}
                         }, null, 2)
                     }
                 }
@@ -204,12 +215,13 @@ async function loadFromGist() {
             if (data.backups) backups = data.backups;
             if (data.giveaways) giveaways = data.giveaways;
             if (data.countingState) countingState = data.countingState;
+            if (data.casino) casino = data.casino;
         }
     } catch (err) {
         console.error('Fout bij laden database:', err.message);
     }
     await migrateDefaultCustomRoles();
-    console.log(`Database geladen: kicks=${kickData.total}, antinuke=${antinukeData.enabled}, customRoles=${customRoles.length}, giveaways=${Object.keys(giveaways).length}`);
+    console.log(`Database geladen: kicks=${kickData.total}, antinuke=${antinukeData.enabled}, customRoles=${customRoles.length}, giveaways=${Object.keys(giveaways).length}, casino=${Object.keys(casino).length}`);
 }
 
 async function migrateDefaultCustomRoles() {
@@ -252,7 +264,8 @@ async function saveToGist() {
                         customRoles,
                         backups,
                         giveaways,
-                        countingState
+                        countingState,
+                        casino
                     }, null, 2)
                 }
             }
@@ -307,464 +320,87 @@ function parseDurationInput(input) {
     return value * multipliers[unit];
 }
 
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.GuildModeration,
-        GatewayIntentBits.GuildVoiceStates,
-        GatewayIntentBits.DirectMessages
-    ],
-    partials: [Partials.Channel, Partials.Message, Partials.User]
-});
-
-const actionTracker = new Map();
-const activeCalls = new Map();
-const callAllowed = new Map();
-const roleCountCache = new Map();
-const callInfoMessages = new Map();
-const linkTracker = new Map();
-
-let membersListMessageId = null;
-let membersUpdateTimeout = null;
-let customRolePanelMessageId = null;
-
-function isCustomRoleManager(interaction) {
-    if (!interaction.member) return false;
-    if (interaction.member.roles?.cache?.has(CONFIG.CUSTOM_ROLE_MANAGER_ROLE_ID)) return true;
-    return false;
-}
-
-function isGiveawayManager(interaction) {
-    if (!interaction.member) return false;
-    if (interaction.member.roles?.cache?.has(CONFIG.GIVEAWAY_MANAGER_ROLE_ID)) return true;
-    return false;
-}
-
-function isBackupManager(userId) {
-    return CONFIG.ANTINUKE_ALLOWED_USERS.includes(userId);
-}
-
-async function countRoleMembers(guild, roleId, forceFetch = false) {
-    const now = Date.now();
-    const cached = roleCountCache.get(roleId);
-    if (!forceFetch && cached && now - cached.fetchedAt < 60000) {
-        return cached.count;
+// --- CASINO HELPERS ---
+function getCasinoUser(userId) {
+    if (!casino[userId]) {
+        casino[userId] = { chips: 100, wins: 0, losses: 0, gamesPlayed: 0 };
     }
-    try {
-        await guild.members.fetch();
-    } catch (err) {
-        console.error('Fout bij members fetch:', err.message);
-    }
-    const role = guild.roles.cache.get(roleId);
-    const count = role ? role.members.size : 0;
-    roleCountCache.set(roleId, { count, fetchedAt: now });
-    return count;
+    return casino[userId];
 }
 
-async function cleanupOldPanels(channel, markerText) {
-    try {
-        const messages = await channel.messages.fetch({ limit: 50 });
-        const old = messages.filter(m =>
-            m.author.id === client.user.id &&
-            m.embeds.length > 0 &&
-            m.embeds[0].description &&
-            m.embeds[0].description.includes(markerText)
-        );
-        for (const msg of old.values()) {
-            await msg.delete().catch(() => {});
-        }
-    } catch (err) {
-        console.error('Fout bij opruimen oude panels:', err);
-    }
+function updateCasinoUser(userId, updates) {
+    const user = getCasinoUser(userId);
+    Object.assign(user, updates);
+    casino[userId] = user;
+    return user;
 }
 
-async function clearChannel(channel) {
-    try {
-        let fetched;
-        do {
-            fetched = await channel.messages.fetch({ limit: 100 });
-            if (fetched.size === 0) break;
-            for (const msg of fetched.values()) {
-                await msg.delete().catch(() => {});
-            }
-        } while (fetched.size > 0);
-    } catch (err) {
-        console.error('Fout bij leegmaken kanaal:', err);
-    }
-}
-
-function updateStatus(guild) {
-    if (!guild) return;
-    client.user.setActivity(`${guild.memberCount} leden`, { type: ActivityType.Watching });
-}
-
-async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
-    try {
-        const channel = await client.channels.fetch(channelId);
-        if (!channel) return;
-        const messages = await channel.messages.fetch({ limit: 20 });
-        const panel = messages.find(m =>
-            m.author.id === client.user.id &&
-            m.components.length > 0 &&
-            m.components[0].components.some(b => b.customId === buttonId)
-        );
-        if (!panel) return;
-
-        const count = await countRoleMembers(channel.guild, roleId, false);
-        const row = new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(buttonId)
-                .setLabel(`${count}`)
-                .setEmoji(emoji)
-                .setStyle(style)
-        );
-        await panel.edit({ components: [row] }).catch(() => {});
-    } catch (err) {
-        console.error('Fout bij refresh panel:', err);
-    }
-}
-
-async function sendLog(guild, channelId, { title, description, color, thumbnail }) {
-    try {
-        const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
-        if (!channel) return;
-        const embed = new EmbedBuilder()
-            .setTitle(title)
-            .setDescription(description)
-            .setColor(color || PURPLE.main)
-            .setTimestamp();
-        if (thumbnail) embed.setThumbnail(thumbnail);
-        else embed.setThumbnail(CONFIG.LOGO_URL);
-        await channel.send({ embeds: [embed] }).catch(() => {});
-    } catch (err) {
-        console.error('Fout bij sturen log:', err);
-    }
-}
-
-function buildHoneypotEmbed() {
+// --- CASINO EMBEDS ---
+function buildCasinoPanelEmbed() {
     return new EmbedBuilder()
-        .setTitle('🍯 Dit is een honeypot kanaal!')
+        .setTitle('🎰 Familie Snus Casino')
         .setDescription(
-            '⚡ **Actie:** KICK\n\n' +
-            '**PLAATS HIER NIETS** - Elk bericht, elke afbeelding, bijlage of sticker die hier geplaatst wordt, zorgt ervoor dat je **direct** gekickt wordt. Geen uitzonderingen!\n\n' +
-            `**Totaal aantal kicks:** ${kickData.total}\n\n` +
-            '🛡️ **Dit kanaal wordt 24/7 automatisch gecontroleerd**'
+            '**Welkom in het casino!**\n\n' +
+            'Iedereen begint met **100 chips**.\n\n' +
+            '**Games:**\n' +
+            '• `/blackjack <inzet>` — speel blackjack tegen de dealer\n' +
+            '• `/roulette <inzet> <kleur>` — kies rood, zwart of groen\n\n' +
+            '**Beloningen:**\n' +
+            '• Blackjack winst: **2x** je inzet\n' +
+            '• Roulette rood/zwart: **2x** je inzet\n' +
+            '• Roulette groen: **14x** je inzet\n\n' +
+            '💡 **Tip:** Je kan je chips altijd zien met `/chips`.'
         )
-        .setColor(PURPLE.main)
-        .setThumbnail(CONFIG.LOGO_URL);
+        .setColor(CASINO_GOLD)
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
 }
 
-async function refreshHoneypotEmbed(channel) {
-    try {
-        const messages = await channel.messages.fetch({ limit: 50 });
-        const panel = messages.find(m =>
-            m.author.id === client.user.id &&
-            m.embeds.length > 0 &&
-            m.embeds[0].description &&
-            m.embeds[0].description.includes('honeypot kanaal')
-        );
-        if (!panel) return;
-        await panel.edit({ embeds: [buildHoneypotEmbed()] }).catch(() => {});
-    } catch (err) {
-        console.error('Fout bij updaten honeypot embed:', err);
-    }
-}
+function buildCasinoLeaderboardEmbed() {
+    const entries = Object.entries(casino)
+        .map(([id, data]) => ({ id, ...data }))
+        .sort((a, b) => b.chips - a.chips)
+        .slice(0, 10);
 
-function getSortedCustomRoles() {
-    return [...customRoles].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
-}
-
-function buildMembersEmbed(guild) {
     let body = '';
-    const uniqueMembers = new Set();
-    const customRoleIds = new Set(customRoles.map(c => c.roleId));
-
-    for (const rank of FIXED_RANKS) {
-        if (customRoleIds.has(rank.roleId)) continue;
-        const role = guild.roles.cache.get(rank.roleId);
-        if (!role) {
-            body += `**${rank.name} (0)**\n➤ Rol niet gevonden\n\n`;
-            continue;
-        }
-        const members = [...role.members.values()]
-            .map(m => ({ id: m.id, name: m.displayName }))
-            .sort((a, b) => a.name.localeCompare(b.name));
-        for (const m of members) uniqueMembers.add(m.id);
-        body += `**${rank.name} (${members.length})**\n`;
-        if (members.length > 0) for (const m of members) body += `➤ <@${m.id}>\n`;
-        else body += `➤ Geen leden\n`;
-        body += `\n`;
-    }
-
-    for (const cr of getSortedCustomRoles()) {
-        const role = guild.roles.cache.get(cr.roleId);
-        if (!role) {
-            body += `**${cr.name} (0)**\n➤ Rol niet gevonden\n\n`;
-            continue;
-        }
-        const members = [...role.members.values()]
-            .map(m => ({ id: m.id, name: m.displayName }))
-            .sort((a, b) => a.name.localeCompare(b.name));
-        for (const m of members) uniqueMembers.add(m.id);
-        body += `**${cr.name} (${members.length})**\n`;
-        if (members.length > 0) for (const m of members) body += `➤ <@${m.id}>\n`;
-        else body += `➤ Geen leden\n`;
-        body += `\n`;
-    }
-
-    const description = `**Totale Familie Snus: ${uniqueMembers.size} leden**\n\n${body}`;
-
-    return new EmbedBuilder()
-        .setTitle('Familie Snus Ledenlijst')
-        .setColor(PURPLE.main)
-        .setDescription(description.slice(0, 4096))
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-        .setThumbnail(CONFIG.LOGO_URL)
-        .setTimestamp();
-}
-
-async function updateMembersList() {
-    try {
-        const guild = client.guilds.cache.first();
-        if (!guild) return;
-
-        const channel = await client.channels.fetch(CONFIG.MEMBERS_LIST_CHANNEL_ID).catch(() => null);
-        if (!channel || !channel.isTextBased()) {
-            console.log('Ledenlijst kanaal niet gevonden');
-            return;
-        }
-
-        const embed = buildMembersEmbed(guild);
-        const payload = { embeds: [embed], allowedMentions: { parse: [] } };
-
-        if (membersListMessageId) {
-            try {
-                const existing = await channel.messages.fetch(membersListMessageId);
-                await existing.edit(payload);
-                return;
-            } catch (err) {
-                membersListMessageId = null;
-            }
-        }
-
-        try {
-            const fetched = await channel.messages.fetch({ limit: 50 });
-            const botMessages = fetched.filter(m => m.author.id === client.user.id);
-            for (const m of botMessages.values()) {
-                await m.delete().catch(() => {});
-            }
-        } catch (err) {}
-
-        const sent = await channel.send(payload);
-        membersListMessageId = sent.id;
-        console.log('Ledenlijst gestuurd');
-    } catch (err) {
-        console.error('Fout bij updaten ledenlijst:', err);
-    }
-}
-
-function scheduleMembersUpdate() {
-    if (membersUpdateTimeout) return;
-    membersUpdateTimeout = setTimeout(() => {
-        membersUpdateTimeout = null;
-        updateMembersList().catch(() => {});
-    }, 3000);
-}
-
-function buildCustomRolePanelEmbed() {
-    let list = '';
-    const sorted = getSortedCustomRoles();
-    const guild = client.guilds.cache.first();
-    if (sorted.length === 0) {
-        list = '_Nog geen custom rollen._';
+    if (entries.length === 0) {
+        body = '_Nog geen spelers._';
     } else {
-        for (let i = 0; i < sorted.length; i++) {
-            const cr = sorted[i];
-            const role = guild?.roles.cache.get(cr.roleId);
-            const displayName = role ? role.name : cr.name;
-            list += `**${i + 1}. ${displayName}** — <@&${cr.roleId}>\n`;
-        }
+        const medals = ['🥇', '🥈', '🥉'];
+        entries.forEach((entry, index) => {
+            const medal = medals[index] || `**${index + 1}.**`;
+            body += `${medal} <@${entry.id}> — **${entry.chips} chips** `;
+            body += `(${entry.wins}W / ${entry.losses}L)\n`;
+        });
     }
 
     return new EmbedBuilder()
-        .setTitle('Custom Roles Beheer')
-        .setDescription(
-            'Beheer hier de custom rollen van **Familie Snus**.\n\n' +
-            '**Huidige custom rollen:**\n' + list + '\n\n' +
-            'Alleen leden met de rol manager kunnen rollen toevoegen, verwijderen, hernoemen of van volgorde wisselen. Nieuwe rollen komen automatisch in het lettertype en verschijnen in de ledenlijst.'
-        )
-        .setColor(PURPLE.main)
+        .setTitle('🏆 Casino Leaderboard — Top 10')
+        .setDescription(`**Rijkste spelers van Familie Snus:**\n\n${body}`)
+        .setColor(CASINO_GOLD)
         .setThumbnail(CONFIG.LOGO_URL)
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
         .setTimestamp();
 }
 
-function buildCustomRolePanelRows() {
-    const row1 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId('cr_add')
-            .setLabel('Rol toevoegen')
-            .setEmoji('➕')
-            .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId('cr_remove')
-            .setLabel('Rol verwijderen')
-            .setEmoji('➖')
-            .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-            .setCustomId('cr_rename')
-            .setLabel('Rol hernoemen')
-            .setEmoji('✏️')
-            .setStyle(ButtonStyle.Secondary)
-    );
-
-    const row2 = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId('cr_up')
-            .setLabel('Omhoog')
-            .setEmoji('⬆️')
-            .setStyle(ButtonStyle.Primary),
-        new ButtonBuilder()
-            .setCustomId('cr_down')
-            .setLabel('Omlaag')
-            .setEmoji('⬇️')
-            .setStyle(ButtonStyle.Primary)
-    );
-
-    return [row1, row2];
-}
-
-async function updateCustomRolePanel() {
+async function updateCasinoLeaderboard() {
     try {
-        const channel = await client.channels.fetch(CONFIG.CUSTOM_ROLE_PANEL_CHANNEL_ID).catch(() => null);
+        const channel = await client.channels.fetch(CONFIG.CASINO_LEADERBOARD_CHANNEL_ID).catch(() => null);
         if (!channel || !channel.isTextBased()) {
-            console.log('Custom role panel kanaal niet gevonden');
+            console.log('Casino leaderboard kanaal niet gevonden');
             return;
         }
 
-        const payload = {
-            embeds: [buildCustomRolePanelEmbed()],
-            components: buildCustomRolePanelRows()
-        };
+        const payload = { embeds: [buildCasinoLeaderboardEmbed()] };
 
-        if (customRolePanelMessageId) {
+        if (casinoLeaderboardMessageId) {
             try {
-                const existing = await channel.messages.fetch(customRolePanelMessageId);
+                const existing = await channel.messages.fetch(casinoLeaderboardMessageId);
                 await existing.edit(payload);
                 return;
             } catch (err) {
-                customRolePanelMessageId = null;
-            }
-        }
-
-        try {
-            const fetched = await channel.messages.fetch({ limit: 50 });
-            const botMessages = fetched.filter(m => m.author.id === client.user.id);
-            for (const m of botMessages.values()) {
-                await m.delete().catch(() => {});
-            }
-        } catch (err) {}
-
-        const sent = await channel.send(payload);
-        customRolePanelMessageId = sent.id;
-        console.log('Custom role panel gestuurd');
-    } catch (err) {
-        console.error('Fout bij updaten custom role panel:', err);
-    }
-}
-
-async function handleAntiLink(message) {
-    if (message.author.bot) return false;
-    if (!message.guild) return false;
-
-    if (message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) return false;
-    if (message.member?.roles?.cache?.has(CONFIG.CUSTOM_ROLE_MANAGER_ROLE_ID)) return false;
-
-    const content = message.content || '';
-    const linkRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|(discord\.gg\/[^\s]+)/i;
-    if (!linkRegex.test(content)) return false;
-
-    const userId = message.author.id;
-    const now = Date.now();
-
-    const timestamps = (linkTracker.get(userId) || []).filter(t => now - t < CONFIG.ANTI_LINK_WINDOW_MS);
-    timestamps.push(now);
-    linkTracker.set(userId, timestamps);
-
-    const count = timestamps.length;
-
-    if (count < CONFIG.ANTI_LINK_WARN_THRESHOLD) {
-        return false;
-    }
-
-    if (count === CONFIG.ANTI_LINK_WARN_THRESHOLD) {
-        try {
-            await message.channel.send({
-                content: `${message.author} - Je hebt **3 links** in 1 minuut gestuurd. Als je **nog 1 link** stuurt binnen 1 minuut, wordt die link verwijderd en krijg je **1 uur timeout** voor anti-link spam.`
-            }).catch(() => {});
-        } catch (err) {
-            console.error('Fout bij anti-link waarschuwing:', err);
-        }
-        return false;
-    }
-
-    try {
-        await message.delete().catch(() => {});
-
-        const member = message.member;
-
-        await message.channel.send({
-            content: `${message.author} - Je link is verwijderd en je krijgt **1 uur timeout** voor anti-link spam.`
-        }).catch(() => {});
-
-        if (member && member.moderatable) {
-            await member.timeout(CONFIG.ANTI_LINK_TIMEOUT_MS, 'Anti-link spam: te veel links binnen 1 minuut').catch(() => {});
-        }
-
-        linkTracker.delete(userId);
-        return true;
-    } catch (err) {
-        console.error('Fout bij anti-link timeout:', err);
-        return true;
-    }
-}
-
-// --- COUNTING GAME ---
-function buildCountingEmbed(state) {
-    const current = state?.current || 0;
-    const highScore = state?.highScore || 0;
-    return new EmbedBuilder()
-        .setTitle('🔢 Tel-spel')
-        .setDescription(
-            `**Huidige stand:** ${current}\n` +
-            `**Highscore:** ${highScore}\n\n` +
-            '**Regels:**\n' +
-            '• Typ het juiste volgende getal.\n' +
-            '• Je mag niet 2x achter elkaar typen.\n' +
-            '• Typ je iets anders of fout, dan begint het spel opnieuw bij 1.'
-        )
-        .setColor(PURPLE.main)
-        .setThumbnail(CONFIG.LOGO_URL)
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-        .setTimestamp();
-}
-
-async function updateCountingEmbed(state) {
-    try {
-        const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID).catch(() => null);
-        if (!channel) return;
-        const payload = buildCountingEmbed(state);
-
-        if (state.lastMessageId) {
-            try {
-                const msg = await channel.messages.fetch(state.lastMessageId);
-                await msg.edit(payload);
-                return;
-            } catch (e) {
-                state.lastMessageId = null;
+                casinoLeaderboardMessageId = null;
             }
         }
 
@@ -774,76 +410,266 @@ async function updateCountingEmbed(state) {
             for (const m of botMessages.values()) {
                 await m.delete().catch(() => {});
             }
-        } catch (e) {}
+        } catch (err) {}
 
         const sent = await channel.send(payload);
-        state.lastMessageId = sent.id;
-        countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
+        casinoLeaderboardMessageId = sent.id;
     } catch (err) {
-        console.error('Fout bij updaten tel-embed:', err);
+        console.error('Fout bij updaten casino leaderboard:', err);
     }
 }
 
-async function handleCountingMessage(message) {
-    if (message.author.bot) return;
-    if (message.channel.id !== CONFIG.COUNTING_CHANNEL_ID) return;
+async function updateCasinoPanel() {
+    try {
+        const channel = await client.channels.fetch(CONFIG.CASINO_CHANNEL_ID).catch(() => null);
+        if (!channel || !channel.isTextBased()) {
+            console.log('Casino kanaal niet gevonden');
+            return;
+        }
 
-    const state = countingState[message.channel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
+        const payload = { embeds: [buildCasinoPanelEmbed()] };
 
-    const content = message.content.trim();
-    const numberMatch = content.match(/^(\d+)$/);
+        if (casinoPanelMessageId) {
+            try {
+                const existing = await channel.messages.fetch(casinoPanelMessageId);
+                await existing.edit(payload);
+                return;
+            } catch (err) {
+                casinoPanelMessageId = null;
+            }
+        }
 
-    if (!numberMatch) {
-        await message.delete().catch(() => {});
-        state.current = 0;
-        state.lastUserId = null;
-        countingState[message.channel.id] = state;
-        await saveToGist();
-        await updateCountingEmbed(state);
-        await message.channel.send({
-            content: `${message.author} - Dat is geen geldig getal. Het spel begint opnieuw bij **1**.`
-        }).catch(() => {});
-        return;
+        try {
+            const fetched = await channel.messages.fetch({ limit: 20 });
+            const botMessages = fetched.filter(m => m.author.id === client.user.id);
+            for (const m of botMessages.values()) {
+                await m.delete().catch(() => {});
+            }
+        } catch (err) {}
+
+        const sent = await channel.send(payload);
+        casinoPanelMessageId = sent.id;
+    } catch (err) {
+        console.error('Fout bij updaten casino panel:', err);
+    }
+}
+
+// --- CASINO GAMES ---
+async function playBlackjack(interaction, bet) {
+    const user = getCasinoUser(interaction.user.id);
+
+    if (bet < 1) {
+        return interaction.reply({ content: '❌ Je moet minstens **1 chip** inzetten.', flags: MessageFlags.Ephemeral });
+    }
+    if (bet > user.chips) {
+        return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
     }
 
-    const typedNumber = parseInt(numberMatch[1], 10);
+    const suits = ['♠️', '♥️', '♦️', '♣️'];
+    const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 
-    if (state.lastUserId === message.author.id) {
-        await message.delete().catch(() => {});
-        state.current = 0;
-        state.lastUserId = null;
-        countingState[message.channel.id] = state;
-        await saveToGist();
-        await updateCountingEmbed(state);
-        await message.channel.send({
-            content: `${message.author} - Je mag niet 2x achter elkaar. Het spel begint opnieuw bij **1**.`
-        }).catch(() => {});
-        return;
+    const drawCard = () => ({
+        suit: suits[Math.floor(Math.random() * suits.length)],
+        rank: ranks[Math.floor(Math.random() * ranks.length)]
+    });
+
+    const cardValue = (card) => {
+        if (card.rank === 'A') return 11;
+        if (['J', 'Q', 'K'].includes(card.rank)) return 10;
+        return parseInt(card.rank, 10);
+    };
+
+    const handValue = (hand) => {
+        let total = 0;
+        let aces = 0;
+        for (const card of hand) {
+            total += cardValue(card);
+            if (card.rank === 'A') aces++;
+        }
+        while (total > 21 && aces > 0) {
+            total -= 10;
+            aces--;
+        }
+        return total;
+    };
+
+    const formatHand = (hand) => hand.map(c => `${c.rank}${c.suit}`).join(' ');
+
+    const playerHand = [drawCard(), drawCard()];
+    const dealerHand = [drawCard(), drawCard()];
+
+    const playerTotal = handValue(playerHand);
+    const dealerTotal = handValue(dealerHand);
+
+    const playerBlackjack = playerTotal === 21;
+    const dealerBlackjack = dealerTotal === 21;
+
+    let result = '';
+    let winnings = 0;
+    let color = PURPLE.main;
+
+    if (playerBlackjack && dealerBlackjack) {
+        result = '🤝 Gelijkspel! Jullie hebben allebei blackjack.';
+        winnings = 0;
+        color = CASINO_GOLD;
+    } else if (playerBlackjack) {
+        result = '🎉 **BLACKJACK!** Je wint 2x je inzet!';
+        winnings = bet * 2;
+        color = CASINO_GREEN;
+    } else if (dealerBlackjack) {
+        result = '💀 De dealer heeft blackjack. Je verliest je inzet.';
+        winnings = -bet;
+        color = CASINO_RED;
+    } else {
+        // Simpele dealer AI: trek tot 17
+        while (handValue(dealerHand) < 17) {
+            dealerHand.push(drawCard());
+        }
+
+        const finalPlayer = handValue(playerHand);
+        const finalDealer = handValue(dealerHand);
+
+        if (finalPlayer > 21) {
+            result = `💥 Je bust met **${finalPlayer}**. Je verliest je inzet.`;
+            winnings = -bet;
+            color = CASINO_RED;
+        } else if (finalDealer > 21) {
+            result = `🎉 De dealer bust met **${finalDealer}**! Je wint 2x je inzet!`;
+            winnings = bet;
+            color = CASINO_GREEN;
+        } else if (finalPlayer > finalDealer) {
+            result = `🎉 Je wint! **${finalPlayer}** tegen **${finalDealer}**. Je wint 2x je inzet!`;
+            winnings = bet;
+            color = CASINO_GREEN;
+        } else if (finalPlayer < finalDealer) {
+            result = `💀 Je verliest. **${finalPlayer}** tegen **${finalDealer}**.`;
+            winnings = -bet;
+            color = CASINO_RED;
+        } else {
+            result = `🤝 Gelijkspel! **${finalPlayer}** tegen **${finalDealer}**.`;
+            winnings = 0;
+            color = CASINO_GOLD;
+        }
     }
 
-    if (typedNumber !== state.current + 1) {
-        await message.react('❌').catch(() => {});
-        const expected = state.current + 1;
-        state.current = 0;
-        state.lastUserId = null;
-        countingState[message.channel.id] = state;
-        await saveToGist();
-        await updateCountingEmbed(state);
-        await message.channel.send({
-            content: `${message.author} - Fout! Je moest **${expected}** typen. Het spel begint opnieuw bij **1**.`
-        }).catch(() => {});
-        return;
-    }
-
-    state.current = typedNumber;
-    state.lastUserId = message.author.id;
-    if (state.current > (state.highScore || 0)) {
-        state.highScore = state.current;
-    }
-    countingState[message.channel.id] = state;
+    const newChips = Math.max(0, user.chips + winnings);
+    updateCasinoUser(interaction.user.id, {
+        chips: newChips,
+        wins: user.wins + (winnings > 0 ? 1 : 0),
+        losses: user.losses + (winnings < 0 ? 1 : 0),
+        gamesPlayed: user.gamesPlayed + 1
+    });
     await saveToGist();
-    await message.react('✅').catch(() => {});
-    await updateCountingEmbed(state);
+
+    const embed = new EmbedBuilder()
+        .setTitle('🃏 Blackjack')
+        .setDescription(
+            `**Jouw hand:** ${formatHand(playerHand)} (**${playerTotal}**)\n` +
+            `**Dealer:** ${formatHand(dealerHand)} (**${dealerTotal}**)\n\n` +
+            `${result}\n\n` +
+            `**Inzet:** ${bet} chips\n` +
+            `**Nieuwe balans:** ${newChips} chips`
+        )
+        .setColor(color)
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
+
+    await interaction.reply({ embeds: [embed] });
+    await updateCasinoLeaderboard();
+    await updateCasinoPanel();
+}
+
+async function playRoulette(interaction, bet, choice) {
+    const user = getCasinoUser(interaction.user.id);
+
+    if (bet < 1) {
+        return interaction.reply({ content: '❌ Je moet minstens **1 chip** inzetten.', flags: MessageFlags.Ephemeral });
+    }
+    if (bet > user.chips) {
+        return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
+    }
+
+    const validChoices = ['rood', 'zwart', 'groen'];
+    const normalized = choice.toLowerCase();
+    if (!validChoices.includes(normalized)) {
+        return interaction.reply({ content: '❌ Kies **rood**, **zwart** of **groen**.', flags: MessageFlags.Ephemeral });
+    }
+
+    // Roulette: 0 (groen) + 1-36
+    const number = Math.floor(Math.random() * 37);
+    const isGreen = number === 0;
+
+    // Rood/zwart verdeling (Europees roulette)
+    const redNumbers = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
+    const isRed = !isGreen && redNumbers.includes(number);
+    const isBlack = !isGreen && !isRed;
+
+    let result = '';
+    let winnings = 0;
+    let color = PURPLE.main;
+
+    if (isGreen) {
+        result = `🟢 **${number} GROEN!**`;
+        color = CASINO_GREEN;
+        if (normalized === 'groen') {
+            winnings = bet * 14;
+            result += ` Je wint **14x** je inzet!`;
+        } else {
+            winnings = -bet;
+            result += ' Je verliest je inzet.';
+            color = CASINO_RED;
+        }
+    } else if (isRed) {
+        result = `🔴 **${number} ROOD!**`;
+        color = CASINO_RED;
+        if (normalized === 'rood') {
+            winnings = bet;
+            result += ' Je wint **2x** je inzet!';
+            color = CASINO_GREEN;
+        } else {
+            winnings = -bet;
+            result += ' Je verliest je inzet.';
+        }
+    } else {
+        result = `⚫ **${number} ZWART!**`;
+        color = '#2b2b2b';
+        if (normalized === 'zwart') {
+            winnings = bet;
+            result += ' Je wint **2x** je inzet!';
+            color = CASINO_GREEN;
+        } else {
+            winnings = -bet;
+            result += ' Je verliest je inzet.';
+            color = CASINO_RED;
+        }
+    }
+
+    const newChips = Math.max(0, user.chips + winnings);
+    updateCasinoUser(interaction.user.id, {
+        chips: newChips,
+        wins: user.wins + (winnings > 0 ? 1 : 0),
+        losses: user.losses + (winnings < 0 ? 1 : 0),
+        gamesPlayed: user.gamesPlayed + 1
+    });
+    await saveToGist();
+
+    const embed = new EmbedBuilder()
+        .setTitle('🎡 Roulette')
+        .setDescription(
+            `${result}\n\n` +
+            `**Jouw keuze:** ${normalized}\n` +
+            `**Inzet:** ${bet} chips\n` +
+            `**Nieuwe balans:** ${newChips} chips`
+        )
+        .setColor(color)
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
+
+    await interaction.reply({ embeds: [embed] });
+    await updateCasinoLeaderboard();
+    await updateCasinoPanel();
 }
 
 // --- CALL PANEL ---
@@ -1087,439 +913,11 @@ async function createCall(interaction, name, isPrivate) {
     });
 }
 
-// --- BACKUP SYSTEEM ---
-function generateBackupId() {
-    return crypto.randomBytes(4).toString('hex').toUpperCase();
-}
-
-async function createBackup(guild, user) {
-    const backupId = generateBackupId();
-
-    const roles = guild.roles.cache
-        .filter(r => r.id !== guild.id && !r.managed)
-        .map(r => ({
-            id: r.id,
-            name: r.name,
-            color: r.color,
-            hoist: r.hoist,
-            mentionable: r.mentionable,
-            position: r.position,
-            permissions: r.permissions.bitfield.toString()
-        }))
-        .sort((a, b) => a.position - b.position);
-
-    const categories = guild.channels.cache
-        .filter(c => c.type === ChannelType.GuildCategory)
-        .map(c => ({
-            id: c.id,
-            name: c.name,
-            position: c.position,
-            permissionOverwrites: c.permissionOverwrites.cache.map(o => ({
-                id: o.id,
-                type: o.type,
-                allow: o.allow.bitfield.toString(),
-                deny: o.deny.bitfield.toString()
-            }))
-        }))
-        .sort((a, b) => a.position - b.position);
-
-    const channels = guild.channels.cache
-        .filter(c => c.type !== ChannelType.GuildCategory)
-        .map(c => ({
-            id: c.id,
-            name: c.name,
-            type: c.type,
-            position: c.position,
-            parentId: c.parentId || null,
-            topic: c.topic || null,
-            nsfw: c.nsfw || false,
-            rateLimitPerUser: c.rateLimitPerUser || 0,
-            bitrate: c.bitrate || null,
-            userLimit: c.userLimit || null,
-            permissionOverwrites: c.permissionOverwrites.cache.map(o => ({
-                id: o.id,
-                type: o.type,
-                allow: o.allow.bitfield.toString(),
-                deny: o.deny.bitfield.toString()
-            }))
-        }))
-        .sort((a, b) => a.position - b.position);
-
-    backups[backupId] = {
-        id: backupId,
-        guildId: guild.id,
-        guildName: guild.name,
-        createdAt: Date.now(),
-        createdBy: user.id,
-        settings: {
-            name: guild.name,
-            verificationLevel: guild.verificationLevel,
-            explicitContentFilter: guild.explicitContentFilter,
-            defaultMessageNotifications: guild.defaultMessageNotifications,
-            afkTimeout: guild.afkTimeout
-        },
-        roles,
-        categories,
-        channels,
-        botConfig: {
-            WELCOME_CHANNEL_ID: CONFIG.WELCOME_CHANNEL_ID,
-            VERIFY_CHANNEL_ID: CONFIG.VERIFY_CHANNEL_ID,
-            VERIFY_ROLE_ID: CONFIG.VERIFY_ROLE_ID,
-            SNAP_CHANNEL_ID: CONFIG.SNAP_CHANNEL_ID,
-            SNAP_ROLE_ID: CONFIG.SNAP_ROLE_ID,
-            HONEYPOT_CHANNEL_ID: CONFIG.HONEYPOT_CHANNEL_ID,
-            HONEYPOT_LOG_ID: CONFIG.HONEYPOT_LOG_ID,
-            CALL_CHANNEL_ID: CONFIG.CALL_CHANNEL_ID,
-            CALL_CATEGORY_ID: CONFIG.CALL_CATEGORY_ID,
-            VERIFY_LOG_ID: CONFIG.VERIFY_LOG_ID,
-            SNAP_LOG_ID: CONFIG.SNAP_LOG_ID,
-            CALL_LOG_ID: CONFIG.CALL_LOG_ID,
-            JOIN_LEAVE_LOG_ID: CONFIG.JOIN_LEAVE_LOG_ID,
-            MEMBERS_LIST_CHANNEL_ID: CONFIG.MEMBERS_LIST_CHANNEL_ID,
-            CUSTOM_ROLE_PANEL_CHANNEL_ID: CONFIG.CUSTOM_ROLE_PANEL_CHANNEL_ID,
-            CUSTOM_ROLE_MANAGER_ROLE_ID: CONFIG.CUSTOM_ROLE_MANAGER_ROLE_ID,
-            GIVEAWAY_CHANNEL_ID: CONFIG.GIVEAWAY_CHANNEL_ID,
-            GIVEAWAY_LOG_ID: CONFIG.GIVEAWAY_LOG_ID,
-            ROLE_MANAGER_LOG_ID: CONFIG.ROLE_MANAGER_LOG_ID,
-            COUNTING_CHANNEL_ID: CONFIG.COUNTING_CHANNEL_ID
-        },
-        customRoles: JSON.parse(JSON.stringify(customRoles))
-    };
-    await saveToGist();
-    return backupId;
-}
-
-async function loadBackup(guild, backupId) {
-    const backup = backups[backupId];
-    if (!backup) throw new Error('Backup niet gevonden.');
-
-    const result = {
-        rolesCreated: 0,
-        rolesUpdated: 0,
-        categoriesCreated: 0,
-        channelsCreated: 0,
-        channelsUpdated: 0,
-        errors: []
-    };
-
-    const roleIdMap = new Map();
-    const sortedRoles = [...backup.roles].sort((a, b) => a.position - b.position);
-
-    for (const r of sortedRoles) {
-        try {
-            const existing = guild.roles.cache.get(r.id) || guild.roles.cache.find(x => x.name === r.name);
-            if (existing) {
-                await existing.edit({
-                    name: r.name,
-                    color: r.color,
-                    hoist: r.hoist,
-                    mentionable: r.mentionable,
-                    permissions: BigInt(r.permissions)
-                }).catch(err => result.errors.push(`Rol ${r.name}: ${err.message}`));
-                roleIdMap.set(r.id, existing.id);
-                result.rolesUpdated++;
-            } else {
-                const newRole = await guild.roles.create({
-                    name: r.name,
-                    color: r.color,
-                    hoist: r.hoist,
-                    mentionable: r.mentionable,
-                    permissions: BigInt(r.permissions),
-                    reason: 'Backup laden'
-                });
-                roleIdMap.set(r.id, newRole.id);
-                result.rolesCreated++;
-            }
-        } catch (err) {
-            result.errors.push(`Rol ${r.name}: ${err.message}`);
-        }
-    }
-
-    const categoryIdMap = new Map();
-    const sortedCategories = [...backup.categories].sort((a, b) => a.position - b.position);
-
-    for (const c of sortedCategories) {
-        try {
-            const overwrites = c.permissionOverwrites.map(o => ({
-                id: o.type === OverwriteType.Role ? (roleIdMap.get(o.id) || o.id) : o.id,
-                type: o.type,
-                allow: BigInt(o.allow),
-                deny: BigInt(o.deny)
-            }));
-
-            const existing = guild.channels.cache.get(c.id) || guild.channels.cache.find(x => x.name === c.name && x.type === ChannelType.GuildCategory);
-            if (existing) {
-                await existing.edit({
-                    name: c.name,
-                    permissionOverwrites: overwrites
-                }).catch(err => result.errors.push(`Categorie ${c.name}: ${err.message}`));
-                categoryIdMap.set(c.id, existing.id);
-            } else {
-                const newCat = await guild.channels.create({
-                    name: c.name,
-                    type: ChannelType.GuildCategory,
-                    permissionOverwrites: overwrites,
-                    reason: 'Backup laden'
-                });
-                categoryIdMap.set(c.id, newCat.id);
-                result.categoriesCreated++;
-            }
-        } catch (err) {
-            result.errors.push(`Categorie ${c.name}: ${err.message}`);
-        }
-    }
-
-    const channelIdMap = new Map();
-    const sortedChannels = [...backup.channels].sort((a, b) => a.position - b.position);
-
-    for (const c of sortedChannels) {
-        try {
-            const overwrites = c.permissionOverwrites.map(o => ({
-                id: o.type === OverwriteType.Role ? (roleIdMap.get(o.id) || o.id) : o.id,
-                type: o.type,
-                allow: BigInt(o.allow),
-                deny: BigInt(o.deny)
-            }));
-
-            const parentId = c.parentId ? (categoryIdMap.get(c.parentId) || c.parentId) : null;
-
-            const existing = guild.channels.cache.get(c.id) || guild.channels.cache.find(x => x.name === c.name && x.type === c.type);
-            if (existing) {
-                await existing.edit({
-                    name: c.name,
-                    parent: parentId,
-                    topic: c.topic || undefined,
-                    nsfw: c.nsfw,
-                    rateLimitPerUser: c.rateLimitPerUser,
-                    permissionOverwrites: overwrites
-                }).catch(err => result.errors.push(`Kanaal ${c.name}: ${err.message}`));
-                channelIdMap.set(c.id, existing.id);
-                result.channelsUpdated++;
-            } else {
-                const newCh = await guild.channels.create({
-                    name: c.name,
-                    type: c.type,
-                    parent: parentId,
-                    topic: c.topic || undefined,
-                    nsfw: c.nsfw,
-                    rateLimitPerUser: c.rateLimitPerUser,
-                    bitrate: c.bitrate || undefined,
-                    userLimit: c.userLimit || undefined,
-                    permissionOverwrites: overwrites,
-                    reason: 'Backup laden'
-                });
-                channelIdMap.set(c.id, newCh.id);
-                result.channelsCreated++;
-            }
-        } catch (err) {
-            result.errors.push(`Kanaal ${c.name}: ${err.message}`);
-        }
-    }
-
-    if (backup.botConfig) {
-        const mapKeys = [
-            'WELCOME_CHANNEL_ID', 'VERIFY_CHANNEL_ID', 'VERIFY_ROLE_ID',
-            'SNAP_CHANNEL_ID', 'SNAP_ROLE_ID', 'HONEYPOT_CHANNEL_ID', 'HONEYPOT_LOG_ID',
-            'CALL_CHANNEL_ID', 'CALL_CATEGORY_ID',
-            'VERIFY_LOG_ID', 'SNAP_LOG_ID', 'CALL_LOG_ID', 'JOIN_LEAVE_LOG_ID',
-            'MEMBERS_LIST_CHANNEL_ID', 'CUSTOM_ROLE_PANEL_CHANNEL_ID',
-            'CUSTOM_ROLE_MANAGER_ROLE_ID', 'GIVEAWAY_CHANNEL_ID',
-            'GIVEAWAY_LOG_ID', 'ROLE_MANAGER_LOG_ID', 'COUNTING_CHANNEL_ID'
-        ];
-        for (const key of mapKeys) {
-            const oldId = backup.botConfig[key];
-            if (!oldId) continue;
-            const newId = roleIdMap.get(oldId) || channelIdMap.get(oldId) || oldId;
-            CONFIG[key] = newId;
-        }
-    }
-
-    if (Array.isArray(backup.customRoles)) {
-        customRoles = backup.customRoles.map((c, i) => ({
-            ...c,
-            roleId: roleIdMap.get(c.roleId) || c.roleId,
-            order: i
-        }));
-    }
-
-    await saveToGist();
-    return result;
-}
-
-// --- GIVEAWAY SYSTEEM ---
-function buildGiveawayEmbed(giveaway) {
-    const ended = giveaway.ended;
-    return new EmbedBuilder()
-        .setTitle(ended ? '🎉 Giveaway afgelopen' : '🎉 Giveaway')
-        .setDescription(
-            `**Prijs:** ${giveaway.prize}\n\n` +
-            (ended
-                ? `**Winnaar(s):** ${giveaway.winners?.map(id => `<@${id}>`).join(', ') || '_Geen deelnemers_'}`
-                : `**Eindigt:** <t:${Math.floor(giveaway.endsAt / 1000)}:R>\n**Deelnemers:** ${giveaway.participants.length}`)
-        )
-        .setColor(PURPLE.main)
-        .setThumbnail(CONFIG.LOGO_URL)
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-        .setTimestamp();
-}
-
-function buildGiveawayRows(messageId, ended) {
-    const rows = [];
-
-    if (!ended) {
-        rows.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`gw_join_${messageId}`)
-                    .setLabel('Deelnemen')
-                    .setEmoji('🎉')
-                    .setStyle(ButtonStyle.Success)
-            )
-        );
-    } else {
-        rows.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`gw_reroll_${messageId}`)
-                    .setLabel('Reroll')
-                    .setEmoji('🔁')
-                    .setStyle(ButtonStyle.Primary)
-            )
-        );
-    }
-
-    return rows;
-}
-
-async function startGiveawayTimer(messageId) {
-    const gw = giveaways[messageId];
-    if (!gw) return;
-    const delay = gw.endsAt - Date.now();
-    setTimeout(async () => {
-        await endGiveaway(messageId);
-    }, Math.max(0, delay));
-}
-
-async function endGiveaway(messageId) {
-    const gw = giveaways[messageId];
-    if (!gw || gw.ended) return;
-
-    gw.ended = true;
-
-    if (gw.participants.length === 0) {
-        gw.winners = [];
-    } else {
-        const winners = [];
-        const pool = [...gw.participants];
-        for (let i = 0; i < Math.min(gw.winnersCount || 1, pool.length); i++) {
-            const idx = Math.floor(Math.random() * pool.length);
-            winners.push(pool[idx]);
-            pool.splice(idx, 1);
-        }
-        gw.winners = winners;
-    }
-
-    await saveToGist();
-
-    try {
-        const channel = await client.channels.fetch(gw.channelId);
-        const msg = await channel.messages.fetch(messageId);
-        await msg.edit({
-            embeds: [buildGiveawayEmbed(gw)],
-            components: buildGiveawayRows(messageId, true)
-        });
-        if (gw.winners.length > 0) {
-            await channel.send(`🎉 Gefeliciteerd ${gw.winners.map(id => `<@${id}>`).join(', ')}! Je hebt **${gw.prize}** gewonnen.`);
-        } else {
-            await channel.send(`😢 Niemand deed mee aan de giveaway voor **${gw.prize}**.`);
-        }
-    } catch (err) {
-        console.error('Fout bij einde giveaway:', err);
-    }
-
-    const guild = client.guilds.cache.first();
-    if (guild) {
-        await sendLog(guild, CONFIG.GIVEAWAY_LOG_ID, {
-            title: '🏁 Giveaway afgelopen',
-            description:
-                `**Prijs:** ${gw.prize}\n` +
-                `**Winnaar(s):** ${gw.winners.length > 0 ? gw.winners.map(id => `<@${id}>`).join(', ') : '_Geen deelnemers_'}\n` +
-                `**Deelnemers:** ${gw.participants.length}`,
-            color: PURPLE.dark
-        });
-    }
-}
-
-async function handleGiveawayButton(interaction) {
-    const customId = interaction.customId;
-
-    if (customId.startsWith('gw_join_')) {
-        const messageId = customId.replace('gw_join_', '');
-        const gw = giveaways[messageId];
-        if (!gw) {
-            return interaction.reply({ content: 'Deze giveaway bestaat niet meer.', flags: MessageFlags.Ephemeral });
-        }
-        if (gw.ended) {
-            return interaction.reply({ content: 'Deze giveaway is al afgelopen.', flags: MessageFlags.Ephemeral });
-        }
-        if (gw.participants.includes(interaction.user.id)) {
-            return interaction.reply({ content: 'Je doet al mee.', flags: MessageFlags.Ephemeral });
-        }
-        gw.participants.push(interaction.user.id);
-        await saveToGist();
-        try {
-            const channel = await client.channels.fetch(gw.channelId);
-            const msg = await channel.messages.fetch(messageId);
-            await msg.edit({ embeds: [buildGiveawayEmbed(gw)], components: buildGiveawayRows(messageId, false) });
-        } catch (err) {}
-        return interaction.reply({ content: '🎉 Je doet mee!', flags: MessageFlags.Ephemeral });
-    }
-
-    if (customId.startsWith('gw_reroll_')) {
-        const messageId = customId.replace('gw_reroll_', '');
-        const gw = giveaways[messageId];
-        if (!gw) {
-            return interaction.reply({ content: 'Deze giveaway bestaat niet meer.', flags: MessageFlags.Ephemeral });
-        }
-        if (!isGiveawayManager(interaction)) {
-            return interaction.reply({ content: 'Je hebt geen toestemming om te rerollen.', flags: MessageFlags.Ephemeral });
-        }
-        if (gw.participants.length === 0) {
-            return interaction.reply({ content: 'Er zijn geen deelnemers om te rerollen.', flags: MessageFlags.Ephemeral });
-        }
-        if (!gw.winners || gw.winners.length === 0) {
-            return interaction.reply({ content: 'Deze giveaway heeft nog geen winnaar.', flags: MessageFlags.Ephemeral });
-        }
-
-        const options = gw.winners.map(id => ({
-            label: `Oude winnaar: ${id}`,
-            value: id
-        }));
-
-        const select = new StringSelectMenuBuilder()
-            .setCustomId(`gw_reroll_old_${messageId}`)
-            .setPlaceholder('Kies de oude winnaar die niet heeft geclaimd')
-            .addOptions(options);
-
-        return interaction.reply({
-            content: 'Kies de oude winnaar die niet heeft geclaimd:',
-            components: [new ActionRowBuilder().addComponents(select)],
-            flags: MessageFlags.Ephemeral
-        });
-    }
-}
-
 // --- BOT ONLINE ---
 client.once('clientReady', async () => {
     console.log(`Ingelogd als ${client.user.tag}`);
 
     await initGist();
-
-    console.log(`Na migratie: customRoles=${customRoles.length}`);
-    if (customRoles.length > 0) {
-        console.log('Custom roles:');
-        for (const c of customRoles) console.log(` - ${c.name} (${c.roleId})`);
-    }
 
     const guild = client.guilds.cache.first();
     if (guild) {
@@ -1599,7 +997,40 @@ client.once('clientReady', async () => {
                         .addChoices(
                             { name: 'Tel Spel', value: 'counting' }
                         )
+                ),
+            new SlashCommandBuilder()
+                .setName('blackjack')
+                .setDescription('Speel blackjack in het casino')
+                .addIntegerOption(opt =>
+                    opt.setName('inzet')
+                        .setDescription('Hoeveel chips zet je in?')
+                        .setRequired(true)
+                        .setMinValue(1)
+                        .setMaxValue(10000)
+                ),
+            new SlashCommandBuilder()
+                .setName('roulette')
+                .setDescription('Speel roulette in het casino')
+                .addIntegerOption(opt =>
+                    opt.setName('inzet')
+                        .setDescription('Hoeveel chips zet je in?')
+                        .setRequired(true)
+                        .setMinValue(1)
+                        .setMaxValue(10000)
                 )
+                .addStringOption(opt =>
+                    opt.setName('kleur')
+                        .setDescription('Kies rood, zwart of groen')
+                        .setRequired(true)
+                        .addChoices(
+                            { name: 'rood', value: 'rood' },
+                            { name: 'zwart', value: 'zwart' },
+                            { name: 'groen', value: 'groen' }
+                        )
+                ),
+            new SlashCommandBuilder()
+                .setName('chips')
+                .setDescription('Bekijk hoeveel chips je hebt')
         ].map(c => c.toJSON());
         await client.application.commands.set(commands);
         console.log('Slash commands geregistreerd');
@@ -1607,6 +1038,7 @@ client.once('clientReady', async () => {
         console.error('Fout bij registreren commands:', err);
     }
 
+    // Verify panel
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
@@ -1624,7 +1056,6 @@ client.once('clientReady', async () => {
                 .setStyle(ButtonStyle.Success);
             const row = new ActionRowBuilder().addComponents(button);
             await verifyChannel.send({ embeds: [embed], components: [row] });
-            console.log(`Verify panel gestuurd (${verifyCount} geverifieerd)`);
         }
     } catch (err) {
         console.error('Fout bij verify panel:', err);
@@ -1632,6 +1063,7 @@ client.once('clientReady', async () => {
 
     await new Promise(r => setTimeout(r, 5000));
 
+    // Snapchat panel
     try {
         const snapChannel = await client.channels.fetch(CONFIG.SNAP_CHANNEL_ID);
         if (snapChannel) {
@@ -1652,51 +1084,69 @@ client.once('clientReady', async () => {
                 .setStyle(ButtonStyle.Primary);
             const row = new ActionRowBuilder().addComponents(button);
             await snapChannel.send({ embeds: [embed], components: [row] });
-            console.log(`Snapchat panel gestuurd (${snapCount} met rol)`);
         }
     } catch (err) {
         console.error('Fout bij snapchat panel:', err);
     }
 
+    // Honeypot
     try {
         const honeyChannel = await client.channels.fetch(CONFIG.HONEYPOT_CHANNEL_ID);
         if (honeyChannel) {
             await clearChannel(honeyChannel);
-            console.log('Honeypot kanaal leeggemaakt');
             await honeyChannel.send({ embeds: [buildHoneypotEmbed()] });
-            console.log('Honeypot waarschuwing gestuurd');
         }
     } catch (err) {
         console.error('Fout bij honeypot panel:', err);
     }
 
+    // Call panel
     try {
         const callChannel = await client.channels.fetch(CONFIG.CALL_CHANNEL_ID);
         if (callChannel) {
             await cleanupOldPanels(callChannel, 'Maak een call aan');
             await callChannel.send(buildCallPanel());
-            console.log('Call panel gestuurd');
         }
     } catch (err) {
         console.error('Fout bij call panel:', err);
     }
 
-    // Counting game start bericht
+    // Counting game paneel
     try {
         const countingChannel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID);
         if (countingChannel) {
             const state = countingState[countingChannel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
             if (!state.highScore) state.highScore = 0;
-            const sent = await countingChannel.send(buildCountingEmbed(state)).catch(() => null);
-            if (sent) {
-                state.lastMessageId = sent.id;
-                countingState[countingChannel.id] = state;
-            }
-            console.log(`Tel-spel paneel gestuurd (stand: ${state.current}, highscore: ${state.highScore})`);
+            countingState[countingChannel.id] = state;
+
+            const payload = {
+                embeds: [new EmbedBuilder()
+                    .setTitle('🔢 Tel-spel')
+                    .setDescription(
+                        `**Huidige stand:** ${state.current}\n` +
+                        `**Highscore:** ${state.highScore}\n\n` +
+                        '**Regels:**\n' +
+                        '• Typ het juiste volgende getal.\n' +
+                        '• Je mag niet 2x achter elkaar typen.\n' +
+                        '• Typ je iets anders of fout, dan begint het spel opnieuw bij 1.'
+                    )
+                    .setColor(PURPLE.main)
+                    .setThumbnail(CONFIG.LOGO_URL)
+                    .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+                    .setTimestamp()]
+            };
+
+            const sent = await countingChannel.send(payload);
+            state.lastMessageId = sent.id;
+            countingState[countingChannel.id] = state;
         }
     } catch (err) {
         console.error('Fout bij tel-spel paneel:', err);
     }
+
+    // Casino panel + leaderboard
+    await updateCasinoPanel();
+    await updateCasinoLeaderboard();
 
     await updateMembersList();
     await updateCustomRolePanel();
@@ -2012,7 +1462,9 @@ client.on('messageCreate', async (message) => {
             CONFIG.GIVEAWAY_CHANNEL_ID,
             CONFIG.GIVEAWAY_LOG_ID,
             CONFIG.ROLE_MANAGER_LOG_ID,
-            CONFIG.COUNTING_CHANNEL_ID
+            CONFIG.COUNTING_CHANNEL_ID,
+            CONFIG.CASINO_CHANNEL_ID,
+            CONFIG.CASINO_LEADERBOARD_CHANNEL_ID
         ];
         if (!protectedChannels.includes(message.channel.id)) {
             const deleted = await handleAntiLink(message);
@@ -2328,12 +1780,38 @@ client.on('interactionCreate', async (interaction) => {
                 state.lastUserId = null;
                 countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
                 await saveToGist();
-                await updateCountingEmbed(state);
 
                 return interaction.editReply({ content: '✅ Tel-spel is gereset. De highscore blijft bewaard.' });
             }
 
             return interaction.reply({ content: '❌ Onbekend spel.', flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.commandName === 'blackjack') {
+            const bet = interaction.options.getInteger('inzet');
+            await playBlackjack(interaction, bet);
+        }
+
+        if (interaction.commandName === 'roulette') {
+            const bet = interaction.options.getInteger('inzet');
+            const choice = interaction.options.getString('kleur');
+            await playRoulette(interaction, bet, choice);
+        }
+
+        if (interaction.commandName === 'chips') {
+            const user = getCasinoUser(interaction.user.id);
+            const embed = new EmbedBuilder()
+                .setTitle('🪙 Jouw chips')
+                .setDescription(
+                    `**Chips:** ${user.chips}\n` +
+                    `**Wins:** ${user.wins}\n` +
+                    `**Losses:** ${user.losses}\n` +
+                    `**Games gespeeld:** ${user.gamesPlayed}`
+                )
+                .setColor(CASINO_GOLD)
+                .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 }))
+                .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
+            await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
         }
         return;
     }
