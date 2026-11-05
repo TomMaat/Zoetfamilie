@@ -107,23 +107,7 @@ const CONFIG = {
     CHIP_GIVER_ID: '1033753872927293520'
 };
 
-const FIXED_RANKS = [
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106', level: 100 },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450', level: 90 },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐃𝐢𝐜𝐭𝐚𝐭𝐨𝐫', roleId: '1567245029255413890', level: 80 },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐋𝐮𝐢𝐭𝐞𝐧𝐚𝐧𝐭', roleId: '1567264503744299109', level: 70 },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐆𝐞𝐧𝐞𝐫𝐚𝐥', roleId: '1567246499069566987', level: 60 },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459', level: 50 }
-];
-
-const DEFAULT_CUSTOM_ROLES = [
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐊𝐨𝐧𝐢𝐧𝐠', roleId: '1567226745143300106' },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐎𝐩𝐩𝐞𝐫𝐜𝐨𝐦𝐦𝐚𝐧𝐝𝐚𝐧𝐭', roleId: '1567241269082726450' },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐃𝐢𝐜𝐭𝐚𝐭𝐨𝐫', roleId: '1567245029255413890' },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐋𝐮𝐢𝐭𝐞𝐧𝐚𝐧𝐭', roleId: '1567264503744299109' },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐆𝐞𝐧𝐞𝐫𝐚𝐥', roleId: '1567246499069566987' },
-    { name: '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬 𝐌𝐚𝐧𝐚𝐠𝐞𝐫', roleId: '1567643616745230459' }
-];
+// GEEN FIXED_RANKS / DEFAULT_CUSTOM_ROLES MEER — alles komt uit de Gist database.
 
 let customRoles = [];
 let giveaways = {};
@@ -182,7 +166,7 @@ async function initGist() {
                             kicks: { total: 0 },
                             antinuke: { enabled: true },
                             joinTimes: {},
-                            customRoles: DEFAULT_CUSTOM_ROLES.map((r, i) => ({ ...r, order: i })),
+                            customRoles: [],
                             backups: {},
                             giveaways: {},
                             countingState: {},
@@ -223,26 +207,7 @@ async function loadFromGist() {
     } catch (err) {
         console.error('Fout bij laden database:', err.message);
     }
-    await migrateDefaultCustomRoles();
     console.log(`Database geladen: kicks=${kickData.total}, antinuke=${antinukeData.enabled}, customRoles=${customRoles.length}, giveaways=${Object.keys(giveaways).length}, casino=${Object.keys(casino).length}`);
-}
-
-async function migrateDefaultCustomRoles() {
-    for (const cr of customRoles) {
-        if (cr.name && cr.name.startsWith('𝐒𝐧𝐮𝐬')) cr.name = cr.name.replace(/^𝐒𝐧𝐮𝐬/, '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬');
-        else if (cr.name && cr.name.startsWith('𝐙𝐨𝐞𝐭')) cr.name = cr.name.replace(/^𝐙𝐨𝐞𝐭/, '𝐅𝐚𝐦𝐢𝐥𝐢𝐞 𝐒𝐧𝐮𝐬');
-    }
-
-    let changed = false;
-    const existingIds = new Set(customRoles.map(c => c.roleId));
-    for (const def of DEFAULT_CUSTOM_ROLES) {
-        if (!existingIds.has(def.roleId)) {
-            customRoles.push({ name: def.name, roleId: def.roleId, order: customRoles.length });
-            changed = true;
-        }
-    }
-    if (changed) customRoles.forEach((c, i) => c.order = i);
-    await saveToGist();
 }
 
 async function saveToGist() {
@@ -347,7 +312,7 @@ async function countRoleMembers(guild, roleId, forceFetch = false) {
     const now = Date.now();
     const cached = roleCountCache.get(roleId);
     if (!forceFetch && cached && now - cached.fetchedAt < 60000) return cached.count;
-    try { await guild.members.fetch(); } catch (err) { console.error('Fout bij members fetch:', err.message); }
+    try { await guild.members.fetch(); } catch (err) { /* rate limit is ok */ }
     const role = guild.roles.cache.get(roleId);
     const count = role ? role.members.size : 0;
     roleCountCache.set(roleId, { count, fetchedAt: now });
@@ -434,19 +399,6 @@ function getSortedCustomRoles() {
 function buildMembersEmbed(guild) {
     let body = '';
     const uniqueMembers = new Set();
-    const customRoleIds = new Set(customRoles.map(c => c.roleId));
-
-    for (const rank of FIXED_RANKS) {
-        if (customRoleIds.has(rank.roleId)) continue;
-        const role = guild.roles.cache.get(rank.roleId);
-        if (!role) { body += `**${rank.name} (0)**\n➤ Rol niet gevonden\n\n`; continue; }
-        const members = [...role.members.values()].map(m => ({ id: m.id, name: m.displayName })).sort((a, b) => a.name.localeCompare(b.name));
-        for (const m of members) uniqueMembers.add(m.id);
-        body += `**${rank.name} (${members.length})**\n`;
-        if (members.length > 0) for (const m of members) body += `➤ <@${m.id}>\n`;
-        else body += `➤ Geen leden\n`;
-        body += `\n`;
-    }
 
     for (const cr of getSortedCustomRoles()) {
         const role = guild.roles.cache.get(cr.roleId);
@@ -458,6 +410,8 @@ function buildMembersEmbed(guild) {
         else body += `➤ Geen leden\n`;
         body += `\n`;
     }
+
+    if (body.trim() === '') body = '_Nog geen rollen in de database._';
 
     return new EmbedBuilder()
         .setTitle('Familie Snus Ledenlijst')
@@ -579,7 +533,7 @@ async function handleAntiLink(message) {
     } catch (err) { return true; }
 }
 
-// --- COUNTING (verwijdert GEEN getallen tijdens lopend spel) ---
+// --- COUNTING ---
 function buildCountingEmbed(state) {
     return new EmbedBuilder()
         .setTitle('🔢 Tel-spel')
@@ -672,7 +626,6 @@ async function handleCountingMessage(message) {
         return reset(`${message.author} - Fout! Je moest **${state.current + 1}** typen. Opnieuw bij **1**.`);
     }
 
-    // Geldige zet — bericht blijft staan, embed wordt geüpdatet
     state.current = typed;
     state.lastUserId = message.author.id;
     if (state.current > (state.highScore || 0)) state.highScore = state.current;
@@ -1314,6 +1267,12 @@ client.once('ready', async () => {
     if (guild) { updateStatus(guild); await setupCallCategory(guild); }
 
     try {
+        // RESET — haal deze 3 regels weg zodra /givechips werkt
+        await client.application.commands.set([]);
+        console.log('Commands gewist');
+        await new Promise(r => setTimeout(r, 5000));
+        // EINDE RESET
+
         const commands = [
             new SlashCommandBuilder().setName('clear').setDescription('Verwijder berichten').addIntegerOption(o => o.setName('amount').setDescription('1-100').setRequired(true).setMinValue(1).setMaxValue(100)).setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
             new SlashCommandBuilder().setName('antinuke').setDescription('Anti-nuke aan/uit').addStringOption(o => o.setName('actie').setDescription('enable of disable').setRequired(true).addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' })),
@@ -1329,10 +1288,14 @@ client.once('ready', async () => {
             new SlashCommandBuilder().setName('chips').setDescription('Bekijk je chips'),
             new SlashCommandBuilder()
                 .setName('givechips')
-                .setDescription('Geef chips aan een gebruiker (alleen eigenaar)')
+                .setDescription('Geef chips aan een gebruiker')
                 .addUserOption(o => o.setName('user').setDescription('Ontvanger').setRequired(true))
                 .addIntegerOption(o => o.setName('amount').setDescription('Aantal chips').setRequired(true).setMinValue(1).setMaxValue(1000000))
         ].map(c => c.toJSON());
+
+        console.log(`Aantal commands: ${commands.length}`);
+        console.log('Command namen:', commands.map(c => c.name).join(', '));
+
         await client.application.commands.set(commands);
         console.log('Slash commands geregistreerd');
     } catch (err) { console.error('Fout bij registreren commands:', err); }
@@ -1442,8 +1405,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const newSnap = newMember.roles.cache.has(CONFIG.SNAP_ROLE_ID);
 
     let rankChanged = false;
-    for (const rank of FIXED_RANKS) if (oldMember.roles.cache.has(rank.roleId) !== newMember.roles.cache.has(rank.roleId)) { rankChanged = true; break; }
-    if (!rankChanged) for (const cr of customRoles) if (oldMember.roles.cache.has(cr.roleId) !== newMember.roles.cache.has(cr.roleId)) { rankChanged = true; break; }
+    for (const cr of customRoles) if (oldMember.roles.cache.has(cr.roleId) !== newMember.roles.cache.has(cr.roleId)) { rankChanged = true; break; }
     if (rankChanged) scheduleMembersUpdate();
 
     if (!oldVerify && newVerify) {
@@ -1639,7 +1601,6 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.commandName === 'customroles') {
             if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-            await migrateDefaultCustomRoles();
             await updateCustomRolePanel();
             return interaction.editReply({ content: '✅ Vernieuwd.' });
         }
