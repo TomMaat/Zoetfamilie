@@ -1,13 +1,14 @@
 {
-  "name": "snus-bot",
+  "name": "familie-snus-bot",
   "version": "1.0.0",
-  "description": "Snus",
+  "description": "Familie Snus",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
   },
   "dependencies": {
-    "discord.js": "^14.14.1"
+    "discord.js": "^14.14.1",
+    "express": "^4.19.2"
   },
   "engines": {
     "node": "18.x"
