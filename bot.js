@@ -47,7 +47,7 @@ const CONFIG = {
     GITHUB_TOKEN: process.env.GITHUB_TOKEN,
     GIST_ID: process.env.GIST_ID || '',
     SERVER_NAME: 'Familie Snus',
-    LOGO_URL: 'https://cdn.discordapp.com/attachments/1567554042039771136/1567660546663383102/40134efe-7805-4254-90b6-79de4620ed6a.png?ex=6aecfd28&is=6aebaba8&hm=80fdcf3fc87f2b51afda037cb67f29aeaf84de04cda3b25c52d8a44e9f9ee6c6&',
+    LOGO_URL: 'https://cdn.discordapp.com/attachments/1567554042039771136/1567660546663383102/40134efe-7805-4254-90b6-79de4620ed6a.png',
 
     WELCOME_CHANNEL_ID: '1567280566041190410',
     VERIFY_CHANNEL_ID: '1567280670915436705',
@@ -839,7 +839,6 @@ async function playCrasher(interaction, bet) {
     await saveToGist();
 
     const gameId = `${interaction.user.id}_${Date.now()}`;
-    // Crashpoint tussen 1.2x en 25x
     const crashPoint = (Math.random() * 23.8) + 1.2;
     const game = { userId: interaction.user.id, bet, multiplier: 1.00, crashPoint, finished: false, interval: null };
     crashGames.set(gameId, game);
@@ -1147,7 +1146,7 @@ async function createCall(interaction, name, isPrivate) {
 }
 
 // --- BOT ONLINE ---
-client.once('clientReady', async () => {
+client.once('ready', async () => {
     console.log(`Ingelogd als ${client.user.tag}`);
     await initGist();
 
