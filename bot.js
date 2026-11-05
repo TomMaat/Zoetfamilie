@@ -76,7 +76,6 @@ const CONFIG = {
     ROLE_MANAGER_LOG_ID: '1567664373739163698',
 
     COUNTING_CHANNEL_ID: '1567857095989264485',
-
     CASINO_CHANNEL_ID: '1567863335620321401',
     CASINO_LEADERBOARD_CHANNEL_ID: '1567863557524033568',
 
@@ -127,7 +126,8 @@ const DEFAULT_CUSTOM_ROLES = [
 let customRoles = [];
 let giveaways = {};
 let countingState = {};
-let casino = {}; // userId -> { chips, wins, losses, gamesPlayed }
+let casino = {};
+let crashGames = new Map();
 let casinoPanelMessageId = null;
 let casinoLeaderboardMessageId = null;
 
@@ -320,7 +320,488 @@ function parseDurationInput(input) {
     return value * multipliers[unit];
 }
 
-// --- CASINO HELPERS ---
+const client = new Client({
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.GuildModeration,
+        GatewayIntentBits.GuildVoiceStates,
+        GatewayIntentBits.DirectMessages
+    ],
+    partials: [Partials.Channel, Partials.Message, Partials.User]
+});
+
+const actionTracker = new Map();
+const activeCalls = new Map();
+const callAllowed = new Map();
+const roleCountCache = new Map();
+const callInfoMessages = new Map();
+const linkTracker = new Map();
+
+let membersListMessageId = null;
+let membersUpdateTimeout = null;
+let customRolePanelMessageId = null;
+
+function isCustomRoleManager(interaction) {
+    if (!interaction.member) return false;
+    if (interaction.member.roles?.cache?.has(CONFIG.CUSTOM_ROLE_MANAGER_ROLE_ID)) return true;
+    return false;
+}
+
+function isGiveawayManager(interaction) {
+    if (!interaction.member) return false;
+    if (interaction.member.roles?.cache?.has(CONFIG.GIVEAWAY_MANAGER_ROLE_ID)) return true;
+    return false;
+}
+
+function isBackupManager(userId) {
+    return CONFIG.ANTINUKE_ALLOWED_USERS.includes(userId);
+}
+
+async function countRoleMembers(guild, roleId, forceFetch = false) {
+    const now = Date.now();
+    const cached = roleCountCache.get(roleId);
+    if (!forceFetch && cached && now - cached.fetchedAt < 60000) {
+        return cached.count;
+    }
+    try {
+        await guild.members.fetch();
+    } catch (err) {
+        console.error('Fout bij members fetch:', err.message);
+    }
+    const role = guild.roles.cache.get(roleId);
+    const count = role ? role.members.size : 0;
+    roleCountCache.set(roleId, { count, fetchedAt: now });
+    return count;
+}
+
+async function cleanupOldPanels(channel, markerText) {
+    try {
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const old = messages.filter(m =>
+            m.author.id === client.user.id &&
+            m.embeds.length > 0 &&
+            m.embeds[0].description &&
+            m.embeds[0].description.includes(markerText)
+        );
+        for (const msg of old.values()) {
+            await msg.delete().catch(() => {});
+        }
+    } catch (err) {
+        console.error('Fout bij opruimen oude panels:', err);
+    }
+}
+
+async function clearChannel(channel) {
+    try {
+        let fetched;
+        do {
+            fetched = await channel.messages.fetch({ limit: 100 });
+            if (fetched.size === 0) break;
+            for (const msg of fetched.values()) {
+                await msg.delete().catch(() => {});
+            }
+        } while (fetched.size > 0);
+    } catch (err) {
+        console.error('Fout bij leegmaken kanaal:', err);
+    }
+}
+
+function updateStatus(guild) {
+    if (!guild) return;
+    client.user.setActivity(`${guild.memberCount} leden`, { type: ActivityType.Watching });
+}
+
+async function refreshPanel(channelId, buttonId, emoji, style, roleId) {
+    try {
+        const channel = await client.channels.fetch(channelId);
+        if (!channel) return;
+        const messages = await channel.messages.fetch({ limit: 20 });
+        const panel = messages.find(m =>
+            m.author.id === client.user.id &&
+            m.components.length > 0 &&
+            m.components[0].components.some(b => b.customId === buttonId)
+        );
+        if (!panel) return;
+
+        const count = await countRoleMembers(channel.guild, roleId, false);
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId(buttonId)
+                .setLabel(`${count}`)
+                .setEmoji(emoji)
+                .setStyle(style)
+        );
+        await panel.edit({ components: [row] }).catch(() => {});
+    } catch (err) {
+        console.error('Fout bij refresh panel:', err);
+    }
+}
+
+async function sendLog(guild, channelId, { title, description, color, thumbnail }) {
+    try {
+        const channel = guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+        if (!channel) return;
+        const embed = new EmbedBuilder()
+            .setTitle(title)
+            .setDescription(description)
+            .setColor(color || PURPLE.main)
+            .setTimestamp();
+        if (thumbnail) embed.setThumbnail(thumbnail);
+        else embed.setThumbnail(CONFIG.LOGO_URL);
+        await channel.send({ embeds: [embed] }).catch(() => {});
+    } catch (err) {
+        console.error('Fout bij sturen log:', err);
+    }
+}
+
+function buildHoneypotEmbed() {
+    return new EmbedBuilder()
+        .setTitle('🍯 Dit is een honeypot kanaal!')
+        .setDescription(
+            '⚡ **Actie:** KICK\n\n' +
+            '**PLAATS HIER NIETS** - Elk bericht, elke afbeelding, bijlage of sticker die hier geplaatst wordt, zorgt ervoor dat je **direct** gekickt wordt. Geen uitzonderingen!\n\n' +
+            `**Totaal aantal kicks:** ${kickData.total}\n\n` +
+            '🛡️ **Dit kanaal wordt 24/7 automatisch gecontroleerd**'
+        )
+        .setColor(PURPLE.main)
+        .setThumbnail(CONFIG.LOGO_URL);
+}
+
+async function refreshHoneypotEmbed(channel) {
+    try {
+        const messages = await channel.messages.fetch({ limit: 50 });
+        const panel = messages.find(m =>
+            m.author.id === client.user.id &&
+            m.embeds.length > 0 &&
+            m.embeds[0].description &&
+            m.embeds[0].description.includes('honeypot kanaal')
+        );
+        if (!panel) return;
+        await panel.edit({ embeds: [buildHoneypotEmbed()] }).catch(() => {});
+    } catch (err) {
+        console.error('Fout bij updaten honeypot embed:', err);
+    }
+}
+
+function getSortedCustomRoles() {
+    return [...customRoles].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+}
+
+function buildMembersEmbed(guild) {
+    let body = '';
+    const uniqueMembers = new Set();
+    const customRoleIds = new Set(customRoles.map(c => c.roleId));
+
+    for (const rank of FIXED_RANKS) {
+        if (customRoleIds.has(rank.roleId)) continue;
+        const role = guild.roles.cache.get(rank.roleId);
+        if (!role) {
+            body += `**${rank.name} (0)**\n➤ Rol niet gevonden\n\n`;
+            continue;
+        }
+        const members = [...role.members.values()]
+            .map(m => ({ id: m.id, name: m.displayName }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+        for (const m of members) uniqueMembers.add(m.id);
+        body += `**${rank.name} (${members.length})**\n`;
+        if (members.length > 0) for (const m of members) body += `➤ <@${m.id}>\n`;
+        else body += `➤ Geen leden\n`;
+        body += `\n`;
+    }
+
+    for (const cr of getSortedCustomRoles()) {
+        const role = guild.roles.cache.get(cr.roleId);
+        if (!role) {
+            body += `**${cr.name} (0)**\n➤ Rol niet gevonden\n\n`;
+            continue;
+        }
+        const members = [...role.members.values()]
+            .map(m => ({ id: m.id, name: m.displayName }))
+            .sort((a, b) => a.name.localeCompare(b.name));
+        for (const m of members) uniqueMembers.add(m.id);
+        body += `**${cr.name} (${members.length})**\n`;
+        if (members.length > 0) for (const m of members) body += `➤ <@${m.id}>\n`;
+        else body += `➤ Geen leden\n`;
+        body += `\n`;
+    }
+
+    const description = `**Totale Familie Snus: ${uniqueMembers.size} leden**\n\n${body}`;
+
+    return new EmbedBuilder()
+        .setTitle('Familie Snus Ledenlijst')
+        .setColor(PURPLE.main)
+        .setDescription(description.slice(0, 4096))
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setTimestamp();
+}
+
+async function updateMembersList() {
+    try {
+        const guild = client.guilds.cache.first();
+        if (!guild) return;
+
+        const channel = await client.channels.fetch(CONFIG.MEMBERS_LIST_CHANNEL_ID).catch(() => null);
+        if (!channel || !channel.isTextBased()) return;
+
+        const embed = buildMembersEmbed(guild);
+        const payload = { embeds: [embed], allowedMentions: { parse: [] } };
+
+        if (membersListMessageId) {
+            try {
+                const existing = await channel.messages.fetch(membersListMessageId);
+                await existing.edit(payload);
+                return;
+            } catch (err) {
+                membersListMessageId = null;
+            }
+        }
+
+        try {
+            const fetched = await channel.messages.fetch({ limit: 50 });
+            const botMessages = fetched.filter(m => m.author.id === client.user.id);
+            for (const m of botMessages.values()) await m.delete().catch(() => {});
+        } catch (err) {}
+
+        const sent = await channel.send(payload);
+        membersListMessageId = sent.id;
+    } catch (err) {
+        console.error('Fout bij updaten ledenlijst:', err);
+    }
+}
+
+function scheduleMembersUpdate() {
+    if (membersUpdateTimeout) return;
+    membersUpdateTimeout = setTimeout(() => {
+        membersUpdateTimeout = null;
+        updateMembersList().catch(() => {});
+    }, 3000);
+}
+
+function buildCustomRolePanelEmbed() {
+    let list = '';
+    const sorted = getSortedCustomRoles();
+    const guild = client.guilds.cache.first();
+    if (sorted.length === 0) {
+        list = '_Nog geen custom rollen._';
+    } else {
+        for (let i = 0; i < sorted.length; i++) {
+            const cr = sorted[i];
+            const role = guild?.roles.cache.get(cr.roleId);
+            const displayName = role ? role.name : cr.name;
+            list += `**${i + 1}. ${displayName}** — <@&${cr.roleId}>\n`;
+        }
+    }
+
+    return new EmbedBuilder()
+        .setTitle('Custom Roles Beheer')
+        .setDescription(
+            'Beheer hier de custom rollen van **Familie Snus**.\n\n' +
+            '**Huidige custom rollen:**\n' + list + '\n\n' +
+            'Alleen leden met de rol manager kunnen rollen toevoegen, verwijderen, hernoemen of van volgorde wisselen.'
+        )
+        .setColor(PURPLE.main)
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
+}
+
+function buildCustomRolePanelRows() {
+    const row1 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cr_add').setLabel('Rol toevoegen').setEmoji('➕').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('cr_remove').setLabel('Rol verwijderen').setEmoji('➖').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('cr_rename').setLabel('Rol hernoemen').setEmoji('✏️').setStyle(ButtonStyle.Secondary)
+    );
+
+    const row2 = new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId('cr_up').setLabel('Omhoog').setEmoji('⬆️').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId('cr_down').setLabel('Omlaag').setEmoji('⬇️').setStyle(ButtonStyle.Primary)
+    );
+
+    return [row1, row2];
+}
+
+async function updateCustomRolePanel() {
+    try {
+        const channel = await client.channels.fetch(CONFIG.CUSTOM_ROLE_PANEL_CHANNEL_ID).catch(() => null);
+        if (!channel || !channel.isTextBased()) return;
+
+        const payload = {
+            embeds: [buildCustomRolePanelEmbed()],
+            components: buildCustomRolePanelRows()
+        };
+
+        if (customRolePanelMessageId) {
+            try {
+                const existing = await channel.messages.fetch(customRolePanelMessageId);
+                await existing.edit(payload);
+                return;
+            } catch (err) {
+                customRolePanelMessageId = null;
+            }
+        }
+
+        try {
+            const fetched = await channel.messages.fetch({ limit: 50 });
+            const botMessages = fetched.filter(m => m.author.id === client.user.id);
+            for (const m of botMessages.values()) await m.delete().catch(() => {});
+        } catch (err) {}
+
+        const sent = await channel.send(payload);
+        customRolePanelMessageId = sent.id;
+    } catch (err) {
+        console.error('Fout bij updaten custom role panel:', err);
+    }
+}
+
+async function handleAntiLink(message) {
+    if (message.author.bot) return false;
+    if (!message.guild) return false;
+    if (message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) return false;
+    if (message.member?.roles?.cache?.has(CONFIG.CUSTOM_ROLE_MANAGER_ROLE_ID)) return false;
+
+    const content = message.content || '';
+    const linkRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|(discord\.gg\/[^\s]+)/i;
+    if (!linkRegex.test(content)) return false;
+
+    const userId = message.author.id;
+    const now = Date.now();
+
+    const timestamps = (linkTracker.get(userId) || []).filter(t => now - t < CONFIG.ANTI_LINK_WINDOW_MS);
+    timestamps.push(now);
+    linkTracker.set(userId, timestamps);
+
+    if (timestamps.length < CONFIG.ANTI_LINK_WARN_THRESHOLD) return false;
+
+    if (timestamps.length === CONFIG.ANTI_LINK_WARN_THRESHOLD) {
+        await message.channel.send({
+            content: `${message.author} - Je hebt **3 links** in 1 minuut gestuurd. Als je **nog 1 link** stuurt binnen 1 minuut, wordt die link verwijderd en krijg je **1 uur timeout** voor anti-link spam.`
+        }).catch(() => {});
+        return false;
+    }
+
+    try {
+        await message.delete().catch(() => {});
+        await message.channel.send({
+            content: `${message.author} - Je link is verwijderd en je krijgt **1 uur timeout** voor anti-link spam.`
+        }).catch(() => {});
+        if (message.member && message.member.moderatable) {
+            await message.member.timeout(CONFIG.ANTI_LINK_TIMEOUT_MS, 'Anti-link spam').catch(() => {});
+        }
+        linkTracker.delete(userId);
+        return true;
+    } catch (err) {
+        return true;
+    }
+}
+
+// --- COUNTING GAME ---
+function buildCountingEmbed(state) {
+    const current = state?.current || 0;
+    const highScore = state?.highScore || 0;
+    return new EmbedBuilder()
+        .setTitle('🔢 Tel-spel')
+        .setDescription(
+            `**Huidige stand:** ${current}\n` +
+            `**Highscore:** ${highScore}\n\n` +
+            '**Regels:**\n' +
+            '• Typ het juiste volgende getal.\n' +
+            '• Je mag niet 2x achter elkaar typen.\n' +
+            '• Typ je iets anders of fout, dan begint het spel opnieuw bij 1.'
+        )
+        .setColor(PURPLE.main)
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
+}
+
+async function updateCountingEmbed(state) {
+    try {
+        const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID).catch(() => null);
+        if (!channel) return;
+        const payload = buildCountingEmbed(state);
+
+        if (state.lastMessageId) {
+            try {
+                const msg = await channel.messages.fetch(state.lastMessageId);
+                await msg.edit(payload);
+                return;
+            } catch (e) {
+                state.lastMessageId = null;
+            }
+        }
+
+        try {
+            const fetched = await channel.messages.fetch({ limit: 20 });
+            const botMessages = fetched.filter(m => m.author.id === client.user.id);
+            for (const m of botMessages.values()) await m.delete().catch(() => {});
+        } catch (e) {}
+
+        const sent = await channel.send(payload);
+        state.lastMessageId = sent.id;
+        countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
+    } catch (err) {
+        console.error('Fout bij updaten tel-embed:', err);
+    }
+}
+
+async function handleCountingMessage(message) {
+    if (message.author.bot) return;
+    if (message.channel.id !== CONFIG.COUNTING_CHANNEL_ID) return;
+
+    const state = countingState[message.channel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
+    const content = message.content.trim();
+    const numberMatch = content.match(/^(\d+)$/);
+
+    if (!numberMatch) {
+        await message.delete().catch(() => {});
+        state.current = 0;
+        state.lastUserId = null;
+        countingState[message.channel.id] = state;
+        await saveToGist();
+        await updateCountingEmbed(state);
+        await message.channel.send({ content: `${message.author} - Dat is geen geldig getal. Het spel begint opnieuw bij **1**.` }).catch(() => {});
+        return;
+    }
+
+    const typed = parseInt(numberMatch[1], 10);
+
+    if (state.lastUserId === message.author.id) {
+        await message.delete().catch(() => {});
+        state.current = 0;
+        state.lastUserId = null;
+        countingState[message.channel.id] = state;
+        await saveToGist();
+        await updateCountingEmbed(state);
+        await message.channel.send({ content: `${message.author} - Je mag niet 2x achter elkaar. Het spel begint opnieuw bij **1**.` }).catch(() => {});
+        return;
+    }
+
+    if (typed !== state.current + 1) {
+        await message.react('❌').catch(() => {});
+        const expected = state.current + 1;
+        state.current = 0;
+        state.lastUserId = null;
+        countingState[message.channel.id] = state;
+        await saveToGist();
+        await updateCountingEmbed(state);
+        await message.channel.send({ content: `${message.author} - Fout! Je moest **${expected}** typen. Het spel begint opnieuw bij **1**.` }).catch(() => {});
+        return;
+    }
+
+    state.current = typed;
+    state.lastUserId = message.author.id;
+    if (state.current > (state.highScore || 0)) state.highScore = state.current;
+    countingState[message.channel.id] = state;
+    await saveToGist();
+    await message.react('✅').catch(() => {});
+    await updateCountingEmbed(state);
+}
+
+// --- CASINO ---
 function getCasinoUser(userId) {
     if (!casino[userId]) {
         casino[userId] = { chips: 100, wins: 0, losses: 0, gamesPlayed: 0 };
@@ -328,14 +809,11 @@ function getCasinoUser(userId) {
     return casino[userId];
 }
 
-function updateCasinoUser(userId, updates) {
-    const user = getCasinoUser(userId);
-    Object.assign(user, updates);
-    casino[userId] = user;
-    return user;
+function resetCasinoUser(userId) {
+    casino[userId] = { chips: 100, wins: 0, losses: 0, gamesPlayed: 0 };
+    return casino[userId];
 }
 
-// --- CASINO EMBEDS ---
 function buildCasinoPanelEmbed() {
     return new EmbedBuilder()
         .setTitle('🎰 Familie Snus Casino')
@@ -344,11 +822,13 @@ function buildCasinoPanelEmbed() {
             'Iedereen begint met **100 chips**.\n\n' +
             '**Games:**\n' +
             '• `/blackjack <inzet>` — speel blackjack tegen de dealer\n' +
-            '• `/roulette <inzet> <kleur>` — kies rood, zwart of groen\n\n' +
+            '• `/roulette <inzet> <kleur>` — kies rood, zwart of groen\n' +
+            '• `/crasher <inzet>` — crash voordat de multiplier klapt\n\n' +
             '**Beloningen:**\n' +
             '• Blackjack winst: **2x** je inzet\n' +
             '• Roulette rood/zwart: **2x** je inzet\n' +
-            '• Roulette groen: **14x** je inzet\n\n' +
+            '• Roulette groen: **14x** je inzet\n' +
+            '• Crasher: tot **10x** je inzet (maar crash kan elk moment)\n\n' +
             '💡 **Tip:** Je kan je chips altijd zien met `/chips`.'
         )
         .setColor(CASINO_GOLD)
@@ -370,8 +850,7 @@ function buildCasinoLeaderboardEmbed() {
         const medals = ['🥇', '🥈', '🥉'];
         entries.forEach((entry, index) => {
             const medal = medals[index] || `**${index + 1}.**`;
-            body += `${medal} <@${entry.id}> — **${entry.chips} chips** `;
-            body += `(${entry.wins}W / ${entry.losses}L)\n`;
+            body += `${medal} <@${entry.id}> — **${entry.chips} chips** (${entry.wins}W / ${entry.losses}L)\n`;
         });
     }
 
@@ -387,11 +866,7 @@ function buildCasinoLeaderboardEmbed() {
 async function updateCasinoLeaderboard() {
     try {
         const channel = await client.channels.fetch(CONFIG.CASINO_LEADERBOARD_CHANNEL_ID).catch(() => null);
-        if (!channel || !channel.isTextBased()) {
-            console.log('Casino leaderboard kanaal niet gevonden');
-            return;
-        }
-
+        if (!channel || !channel.isTextBased()) return;
         const payload = { embeds: [buildCasinoLeaderboardEmbed()] };
 
         if (casinoLeaderboardMessageId) {
@@ -399,7 +874,7 @@ async function updateCasinoLeaderboard() {
                 const existing = await channel.messages.fetch(casinoLeaderboardMessageId);
                 await existing.edit(payload);
                 return;
-            } catch (err) {
+            } catch (e) {
                 casinoLeaderboardMessageId = null;
             }
         }
@@ -407,10 +882,8 @@ async function updateCasinoLeaderboard() {
         try {
             const fetched = await channel.messages.fetch({ limit: 20 });
             const botMessages = fetched.filter(m => m.author.id === client.user.id);
-            for (const m of botMessages.values()) {
-                await m.delete().catch(() => {});
-            }
-        } catch (err) {}
+            for (const m of botMessages.values()) await m.delete().catch(() => {});
+        } catch (e) {}
 
         const sent = await channel.send(payload);
         casinoLeaderboardMessageId = sent.id;
@@ -422,11 +895,7 @@ async function updateCasinoLeaderboard() {
 async function updateCasinoPanel() {
     try {
         const channel = await client.channels.fetch(CONFIG.CASINO_CHANNEL_ID).catch(() => null);
-        if (!channel || !channel.isTextBased()) {
-            console.log('Casino kanaal niet gevonden');
-            return;
-        }
-
+        if (!channel || !channel.isTextBased()) return;
         const payload = { embeds: [buildCasinoPanelEmbed()] };
 
         if (casinoPanelMessageId) {
@@ -434,7 +903,7 @@ async function updateCasinoPanel() {
                 const existing = await channel.messages.fetch(casinoPanelMessageId);
                 await existing.edit(payload);
                 return;
-            } catch (err) {
+            } catch (e) {
                 casinoPanelMessageId = null;
             }
         }
@@ -442,10 +911,8 @@ async function updateCasinoPanel() {
         try {
             const fetched = await channel.messages.fetch({ limit: 20 });
             const botMessages = fetched.filter(m => m.author.id === client.user.id);
-            for (const m of botMessages.values()) {
-                await m.delete().catch(() => {});
-            }
-        } catch (err) {}
+            for (const m of botMessages.values()) await m.delete().catch(() => {});
+        } catch (e) {}
 
         const sent = await channel.send(payload);
         casinoPanelMessageId = sent.id;
@@ -454,122 +921,62 @@ async function updateCasinoPanel() {
     }
 }
 
-// --- CASINO GAMES ---
 async function playBlackjack(interaction, bet) {
     const user = getCasinoUser(interaction.user.id);
 
-    if (bet < 1) {
-        return interaction.reply({ content: '❌ Je moet minstens **1 chip** inzetten.', flags: MessageFlags.Ephemeral });
+    if (user.chips <= 0) {
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setEmoji('🔄').setStyle(ButtonStyle.Success)
+        );
+        return interaction.reply({ content: '💸 Je hebt **0 chips**. Reset naar 100 chips om verder te spelen.', components: [row], flags: MessageFlags.Ephemeral });
     }
-    if (bet > user.chips) {
-        return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
-    }
+    if (bet < 1) return interaction.reply({ content: '❌ Minstens **1 chip**.', flags: MessageFlags.Ephemeral });
+    if (bet > user.chips) return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
 
     const suits = ['♠️', '♥️', '♦️', '♣️'];
     const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
-
-    const drawCard = () => ({
-        suit: suits[Math.floor(Math.random() * suits.length)],
-        rank: ranks[Math.floor(Math.random() * ranks.length)]
-    });
-
-    const cardValue = (card) => {
-        if (card.rank === 'A') return 11;
-        if (['J', 'Q', 'K'].includes(card.rank)) return 10;
-        return parseInt(card.rank, 10);
+    const draw = () => ({ suit: suits[Math.floor(Math.random() * 4)], rank: ranks[Math.floor(Math.random() * 13)] });
+    const val = (c) => c.rank === 'A' ? 11 : ['J', 'Q', 'K'].includes(c.rank) ? 10 : parseInt(c.rank, 10);
+    const total = (h) => {
+        let t = 0, a = 0;
+        for (const c of h) { t += val(c); if (c.rank === 'A') a++; }
+        while (t > 21 && a > 0) { t -= 10; a--; }
+        return t;
     };
+    const fmt = (h) => h.map(c => `${c.rank}${c.suit}`).join(' ');
 
-    const handValue = (hand) => {
-        let total = 0;
-        let aces = 0;
-        for (const card of hand) {
-            total += cardValue(card);
-            if (card.rank === 'A') aces++;
-        }
-        while (total > 21 && aces > 0) {
-            total -= 10;
-            aces--;
-        }
-        return total;
-    };
+    const player = [draw(), draw()];
+    const dealer = [draw(), draw()];
+    const pt = total(player);
+    const dt = total(dealer);
 
-    const formatHand = (hand) => hand.map(c => `${c.rank}${c.suit}`).join(' ');
+    let result, winnings, color;
 
-    const playerHand = [drawCard(), drawCard()];
-    const dealerHand = [drawCard(), drawCard()];
-
-    const playerTotal = handValue(playerHand);
-    const dealerTotal = handValue(dealerHand);
-
-    const playerBlackjack = playerTotal === 21;
-    const dealerBlackjack = dealerTotal === 21;
-
-    let result = '';
-    let winnings = 0;
-    let color = PURPLE.main;
-
-    if (playerBlackjack && dealerBlackjack) {
-        result = '🤝 Gelijkspel! Jullie hebben allebei blackjack.';
-        winnings = 0;
-        color = CASINO_GOLD;
-    } else if (playerBlackjack) {
-        result = '🎉 **BLACKJACK!** Je wint 2x je inzet!';
-        winnings = bet * 2;
-        color = CASINO_GREEN;
-    } else if (dealerBlackjack) {
-        result = '💀 De dealer heeft blackjack. Je verliest je inzet.';
-        winnings = -bet;
-        color = CASINO_RED;
-    } else {
-        // Simpele dealer AI: trek tot 17
-        while (handValue(dealerHand) < 17) {
-            dealerHand.push(drawCard());
-        }
-
-        const finalPlayer = handValue(playerHand);
-        const finalDealer = handValue(dealerHand);
-
-        if (finalPlayer > 21) {
-            result = `💥 Je bust met **${finalPlayer}**. Je verliest je inzet.`;
-            winnings = -bet;
-            color = CASINO_RED;
-        } else if (finalDealer > 21) {
-            result = `🎉 De dealer bust met **${finalDealer}**! Je wint 2x je inzet!`;
-            winnings = bet;
-            color = CASINO_GREEN;
-        } else if (finalPlayer > finalDealer) {
-            result = `🎉 Je wint! **${finalPlayer}** tegen **${finalDealer}**. Je wint 2x je inzet!`;
-            winnings = bet;
-            color = CASINO_GREEN;
-        } else if (finalPlayer < finalDealer) {
-            result = `💀 Je verliest. **${finalPlayer}** tegen **${finalDealer}**.`;
-            winnings = -bet;
-            color = CASINO_RED;
-        } else {
-            result = `🤝 Gelijkspel! **${finalPlayer}** tegen **${finalDealer}**.`;
-            winnings = 0;
-            color = CASINO_GOLD;
-        }
+    if (pt === 21 && dt === 21) { result = '🤝 Gelijkspel (beide blackjack).'; winnings = 0; color = CASINO_GOLD; }
+    else if (pt === 21) { result = '🎉 **BLACKJACK!** Je wint 2x!'; winnings = bet * 2; color = CASINO_GREEN; }
+    else if (dt === 21) { result = '💀 Dealer blackjack. Je verliest.'; winnings = -bet; color = CASINO_RED; }
+    else {
+        while (total(dealer) < 17) dealer.push(draw());
+        const fp = total(player), fd = total(dealer);
+        if (fp > 21) { result = `💥 Bust met **${fp}**.`; winnings = -bet; color = CASINO_RED; }
+        else if (fd > 21) { result = `🎉 Dealer bust met **${fd}**! Je wint 2x!`; winnings = bet; color = CASINO_GREEN; }
+        else if (fp > fd) { result = `🎉 Je wint! **${fp}** vs **${fd}**.`; winnings = bet; color = CASINO_GREEN; }
+        else if (fp < fd) { result = `💀 Je verliest. **${fp}** vs **${fd}**.`; winnings = -bet; color = CASINO_RED; }
+        else { result = `🤝 Gelijkspel! **${fp}** vs **${fd}**.`; winnings = 0; color = CASINO_GOLD; }
     }
 
     const newChips = Math.max(0, user.chips + winnings);
-    updateCasinoUser(interaction.user.id, {
+    casino[interaction.user.id] = {
         chips: newChips,
         wins: user.wins + (winnings > 0 ? 1 : 0),
         losses: user.losses + (winnings < 0 ? 1 : 0),
         gamesPlayed: user.gamesPlayed + 1
-    });
+    };
     await saveToGist();
 
     const embed = new EmbedBuilder()
         .setTitle('🃏 Blackjack')
-        .setDescription(
-            `**Jouw hand:** ${formatHand(playerHand)} (**${playerTotal}**)\n` +
-            `**Dealer:** ${formatHand(dealerHand)} (**${dealerTotal}**)\n\n` +
-            `${result}\n\n` +
-            `**Inzet:** ${bet} chips\n` +
-            `**Nieuwe balans:** ${newChips} chips`
-        )
+        .setDescription(`**Jouw hand:** ${fmt(player)} (**${pt}**)\n**Dealer:** ${fmt(dealer)} (**${dt}**)\n\n${result}\n\n**Inzet:** ${bet} chips\n**Nieuwe balans:** ${newChips} chips`)
         .setColor(color)
         .setThumbnail(CONFIG.LOGO_URL)
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
@@ -583,91 +990,172 @@ async function playBlackjack(interaction, bet) {
 async function playRoulette(interaction, bet, choice) {
     const user = getCasinoUser(interaction.user.id);
 
-    if (bet < 1) {
-        return interaction.reply({ content: '❌ Je moet minstens **1 chip** inzetten.', flags: MessageFlags.Ephemeral });
+    if (user.chips <= 0) {
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setEmoji('🔄').setStyle(ButtonStyle.Success)
+        );
+        return interaction.reply({ content: '💸 Je hebt **0 chips**. Reset naar 100 chips om verder te spelen.', components: [row], flags: MessageFlags.Ephemeral });
     }
-    if (bet > user.chips) {
-        return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
-    }
+    if (bet < 1) return interaction.reply({ content: '❌ Minstens **1 chip**.', flags: MessageFlags.Ephemeral });
+    if (bet > user.chips) return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
 
-    const validChoices = ['rood', 'zwart', 'groen'];
-    const normalized = choice.toLowerCase();
-    if (!validChoices.includes(normalized)) {
-        return interaction.reply({ content: '❌ Kies **rood**, **zwart** of **groen**.', flags: MessageFlags.Ephemeral });
-    }
+    const valid = ['rood', 'zwart', 'groen'];
+    const c = choice.toLowerCase();
+    if (!valid.includes(c)) return interaction.reply({ content: '❌ Kies rood, zwart of groen.', flags: MessageFlags.Ephemeral });
 
-    // Roulette: 0 (groen) + 1-36
-    const number = Math.floor(Math.random() * 37);
-    const isGreen = number === 0;
+    const n = Math.floor(Math.random() * 37);
+    const isGreen = n === 0;
+    const redNums = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
+    const isRed = !isGreen && redNums.includes(n);
 
-    // Rood/zwart verdeling (Europees roulette)
-    const redNumbers = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
-    const isRed = !isGreen && redNumbers.includes(number);
-    const isBlack = !isGreen && !isRed;
-
-    let result = '';
-    let winnings = 0;
-    let color = PURPLE.main;
+    let result, winnings, color;
 
     if (isGreen) {
-        result = `🟢 **${number} GROEN!**`;
+        result = `🟢 **${n} GROEN!**`;
         color = CASINO_GREEN;
-        if (normalized === 'groen') {
-            winnings = bet * 14;
-            result += ` Je wint **14x** je inzet!`;
-        } else {
-            winnings = -bet;
-            result += ' Je verliest je inzet.';
-            color = CASINO_RED;
-        }
+        if (c === 'groen') { winnings = bet * 14; result += ' Je wint **14x**!'; }
+        else { winnings = -bet; result += ' Je verliest.'; color = CASINO_RED; }
     } else if (isRed) {
-        result = `🔴 **${number} ROOD!**`;
+        result = `🔴 **${n} ROOD!**`;
         color = CASINO_RED;
-        if (normalized === 'rood') {
-            winnings = bet;
-            result += ' Je wint **2x** je inzet!';
-            color = CASINO_GREEN;
-        } else {
-            winnings = -bet;
-            result += ' Je verliest je inzet.';
-        }
+        if (c === 'rood') { winnings = bet; result += ' Je wint **2x**!'; color = CASINO_GREEN; }
+        else { winnings = -bet; result += ' Je verliest.'; }
     } else {
-        result = `⚫ **${number} ZWART!**`;
+        result = `⚫ **${n} ZWART!**`;
         color = '#2b2b2b';
-        if (normalized === 'zwart') {
-            winnings = bet;
-            result += ' Je wint **2x** je inzet!';
-            color = CASINO_GREEN;
-        } else {
-            winnings = -bet;
-            result += ' Je verliest je inzet.';
-            color = CASINO_RED;
-        }
+        if (c === 'zwart') { winnings = bet; result += ' Je wint **2x**!'; color = CASINO_GREEN; }
+        else { winnings = -bet; result += ' Je verliest.'; color = CASINO_RED; }
     }
 
     const newChips = Math.max(0, user.chips + winnings);
-    updateCasinoUser(interaction.user.id, {
+    casino[interaction.user.id] = {
         chips: newChips,
         wins: user.wins + (winnings > 0 ? 1 : 0),
         losses: user.losses + (winnings < 0 ? 1 : 0),
         gamesPlayed: user.gamesPlayed + 1
-    });
+    };
     await saveToGist();
 
     const embed = new EmbedBuilder()
         .setTitle('🎡 Roulette')
-        .setDescription(
-            `${result}\n\n` +
-            `**Jouw keuze:** ${normalized}\n` +
-            `**Inzet:** ${bet} chips\n` +
-            `**Nieuwe balans:** ${newChips} chips`
-        )
+        .setDescription(`${result}\n\n**Jouw keuze:** ${c}\n**Inzet:** ${bet} chips\n**Nieuwe balans:** ${newChips} chips`)
         .setColor(color)
         .setThumbnail(CONFIG.LOGO_URL)
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
         .setTimestamp();
 
     await interaction.reply({ embeds: [embed] });
+    await updateCasinoLeaderboard();
+    await updateCasinoPanel();
+}
+
+// --- CRASHER ---
+function buildCrasherEmbed(game, multiplier, status, color) {
+    return new EmbedBuilder()
+        .setTitle('🚀 Crasher')
+        .setDescription(
+            `**Inzet:** ${game.bet} chips\n` +
+            `**Huidige multiplier:** **${multiplier.toFixed(2)}x**\n` +
+            `**Mogelijke winst:** ${Math.floor(game.bet * multiplier)} chips\n\n` +
+            `${status}`
+        )
+        .setColor(color || (multiplier >= 2 ? CASINO_GREEN : CASINO_GOLD))
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
+}
+
+function buildCrasherRows(gameId, active) {
+    if (!active) return [];
+    return [
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`crash_cashout_${gameId}`).setLabel('Cash Out').setEmoji('💰').setStyle(ButtonStyle.Success)
+        )
+    ];
+}
+
+async function playCrasher(interaction, bet) {
+    const user = getCasinoUser(interaction.user.id);
+
+    if (user.chips <= 0) {
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setEmoji('🔄').setStyle(ButtonStyle.Success)
+        );
+        return interaction.reply({ content: '💸 Je hebt **0 chips**. Reset naar 100 chips om verder te spelen.', components: [row], flags: MessageFlags.Ephemeral });
+    }
+    if (bet < 1) return interaction.reply({ content: '❌ Minstens **1 chip**.', flags: MessageFlags.Ephemeral });
+    if (bet > user.chips) return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
+
+    user.chips -= bet;
+    await saveToGist();
+
+    const gameId = `${interaction.user.id}_${Date.now()}`;
+    const crashPoint = (Math.random() * 8) + 1.2;
+    const game = { userId: interaction.user.id, bet, multiplier: 1.00, crashPoint, finished: false, interval: null };
+    crashGames.set(gameId, game);
+
+    await interaction.reply({
+        embeds: [buildCrasherEmbed(game, 1.00, 'Klik op **Cash Out** voordat de multiplier crasht!')],
+        components: buildCrasherRows(gameId, true)
+    });
+
+    const message = await interaction.fetchReply();
+
+    game.interval = setInterval(async () => {
+        if (game.finished) {
+            clearInterval(game.interval);
+            return;
+        }
+
+        game.multiplier += 0.1;
+
+        if (game.multiplier >= game.crashPoint) {
+            game.finished = true;
+            clearInterval(game.interval);
+            crashGames.delete(gameId);
+
+            const u = getCasinoUser(game.userId);
+            u.losses += 1;
+            u.gamesPlayed += 1;
+            await saveToGist();
+
+            await message.edit({
+                embeds: [buildCrasherEmbed(game, game.multiplier, `💥 **CRASH!** De multiplier klapte op **${game.crashPoint.toFixed(2)}x**. Je verliest **${game.bet} chips**.`, CASINO_RED)],
+                components: []
+            }).catch(() => {});
+
+            await updateCasinoLeaderboard();
+            await updateCasinoPanel();
+        } else {
+            await message.edit({
+                embeds: [buildCrasherEmbed(game, game.multiplier, 'Klik op **Cash Out** voordat de multiplier crasht!')],
+                components: buildCrasherRows(gameId, true)
+            }).catch(() => {});
+        }
+    }, 600);
+}
+
+async function handleCrashCashout(interaction, gameId) {
+    const game = crashGames.get(gameId);
+    if (!game) return interaction.reply({ content: 'Deze game is verlopen.', flags: MessageFlags.Ephemeral });
+    if (game.userId !== interaction.user.id) return interaction.reply({ content: 'Dit is niet jouw game.', flags: MessageFlags.Ephemeral });
+
+    game.finished = true;
+    clearInterval(game.interval);
+    crashGames.delete(gameId);
+
+    const winnings = Math.floor(game.bet * game.multiplier);
+    const u = getCasinoUser(game.userId);
+    u.chips += winnings;
+    u.wins += 1;
+    u.gamesPlayed += 1;
+    await saveToGist();
+
+    await interaction.update({
+        embeds: [buildCrasherEmbed(game, game.multiplier, `💰 **Cash Out!** Je wint **${winnings} chips** op **${game.multiplier.toFixed(2)}x**!`, CASINO_GREEN)],
+        components: []
+    });
+
     await updateCasinoLeaderboard();
     await updateCasinoPanel();
 }
@@ -686,21 +1174,9 @@ function buildCallPanel() {
         .setThumbnail(CONFIG.LOGO_URL);
 
     const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId('call_open_public')
-            .setLabel('Openbaar')
-            .setEmoji('🔊')
-            .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId('call_open_private')
-            .setLabel('Privé')
-            .setEmoji('🔒')
-            .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-            .setCustomId('call_office_panel')
-            .setLabel('Kantoor')
-            .setEmoji('📋')
-            .setStyle(ButtonStyle.Secondary)
+        new ButtonBuilder().setCustomId('call_open_public').setLabel('Openbaar').setEmoji('🔊').setStyle(ButtonStyle.Success),
+        new ButtonBuilder().setCustomId('call_open_private').setLabel('Privé').setEmoji('🔒').setStyle(ButtonStyle.Danger),
+        new ButtonBuilder().setCustomId('call_office_panel').setLabel('Kantoor').setEmoji('📋').setStyle(ButtonStyle.Secondary)
     );
 
     return { embeds: [embed], components: [row] };
@@ -709,15 +1185,11 @@ function buildCallPanel() {
 async function setupCallCategory(guild) {
     try {
         const category = guild.channels.cache.get(CONFIG.CALL_CATEGORY_ID);
-        if (!category) {
-            console.log('Call categorie niet gevonden');
-            return;
-        }
+        if (!category) return;
         await category.permissionOverwrites.set([
             { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
             { id: CONFIG.VERIFY_ROLE_ID, allow: [PermissionFlagsBits.ViewChannel] }
         ]);
-        console.log('Call categorie rechten ingesteld');
     } catch (err) {
         console.error('Fout bij instellen call categorie:', err);
     }
@@ -725,62 +1197,28 @@ async function setupCallCategory(guild) {
 
 function buildCallInfoMessage(channelId, ownerId, isPrivate) {
     const allowed = callAllowed.get(channelId) || new Set();
-
     let allowedList = '_Niemand anders heeft toegang._';
     if (allowed.size > 1) {
-        allowedList = Array.from(allowed)
-            .filter(id => id !== ownerId)
-            .map(id => `<@${id}>`)
-            .join('\n');
+        allowedList = Array.from(allowed).filter(id => id !== ownerId).map(id => `<@${id}>`).join('\n');
     }
 
     const embed = new EmbedBuilder()
         .setTitle(isPrivate ? '🔒 Privé call aangemaakt' : '🔊 Openbare call aangemaakt')
-        .setDescription(
-            `**Eigenaar:** <@${ownerId}>\n` +
-            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n` +
-            `**Kanaal:** <#${channelId}>\n\n` +
-            `**Toegang:**\n${allowedList}\n\n` +
-            (isPrivate
-                ? 'Alleen jij kan mensen toelaten of verwijderen.'
-                : 'Iedereen met verify kan joinen.')
-        )
+        .setDescription(`**Eigenaar:** <@${ownerId}>\n**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n**Kanaal:** <#${channelId}>\n\n**Toegang:**\n${allowedList}\n\n${isPrivate ? 'Alleen jij kan mensen toelaten of verwijderen.' : 'Iedereen met verify kan joinen.'}`)
         .setColor(PURPLE.main)
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
 
     const rows = [];
-
     if (isPrivate) {
-        rows.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`call_allow_${channelId}`)
-                    .setLabel('Iemand toelaten')
-                    .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success),
-                new ButtonBuilder()
-                    .setCustomId(`call_remove_${channelId}`)
-                    .setLabel('Iemand verwijderen')
-                    .setEmoji('➖')
-                    .setStyle(ButtonStyle.Secondary)
-            )
-        );
+        rows.push(new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`call_allow_${channelId}`).setLabel('Iemand toelaten').setEmoji('✅').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`call_remove_${channelId}`).setLabel('Iemand verwijderen').setEmoji('➖').setStyle(ButtonStyle.Secondary)
+        ));
     }
-
-    rows.push(
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(`call_hide_${channelId}`)
-                .setLabel('Verberg dit bericht')
-                .setEmoji('🙈')
-                .setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder()
-                .setCustomId(`call_delete_${channelId}`)
-                .setLabel('Verwijder call')
-                .setEmoji('🗑️')
-                .setStyle(ButtonStyle.Danger)
-        )
-    );
+    rows.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`call_hide_${channelId}`).setLabel('Verberg dit bericht').setEmoji('🙈').setStyle(ButtonStyle.Secondary),
+        new ButtonBuilder().setCustomId(`call_delete_${channelId}`).setLabel('Verwijder call').setEmoji('🗑️').setStyle(ButtonStyle.Danger)
+    ));
 
     return { embeds: [embed], components: rows };
 }
@@ -788,44 +1226,20 @@ function buildCallInfoMessage(channelId, ownerId, isPrivate) {
 function buildCallControlMessage(channelId, ownerId, isPrivate) {
     const embed = new EmbedBuilder()
         .setTitle(isPrivate ? '🔒 Privé call' : '🔊 Openbare call')
-        .setDescription(
-            `**Eigenaar:** <@${ownerId}>\n` +
-            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n\n` +
-            (isPrivate
-                ? 'Alleen de eigenaar kan mensen toelaten of verwijderen via de knoppen hieronder.'
-                : 'Iedereen met verify kan joinen.')
-        )
+        .setDescription(`**Eigenaar:** <@${ownerId}>\n**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n\n${isPrivate ? 'Alleen de eigenaar kan mensen toelaten of verwijderen.' : 'Iedereen met verify kan joinen.'}`)
         .setColor(PURPLE.main)
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
 
     const rows = [];
-
     if (isPrivate) {
-        rows.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`call_allow_${channelId}`)
-                    .setLabel('Iemand toelaten')
-                    .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success),
-                new ButtonBuilder()
-                    .setCustomId(`call_remove_${channelId}`)
-                    .setLabel('Iemand verwijderen')
-                    .setEmoji('➖')
-                    .setStyle(ButtonStyle.Secondary)
-            )
-        );
+        rows.push(new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId(`call_allow_${channelId}`).setLabel('Iemand toelaten').setEmoji('✅').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`call_remove_${channelId}`).setLabel('Iemand verwijderen').setEmoji('➖').setStyle(ButtonStyle.Secondary)
+        ));
     }
-
-    rows.push(
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(`call_delete_${channelId}`)
-                .setLabel('Verwijder call')
-                .setEmoji('🗑️')
-                .setStyle(ButtonStyle.Danger)
-        )
-    );
+    rows.push(new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`call_delete_${channelId}`).setLabel('Verwijder call').setEmoji('🗑️').setStyle(ButtonStyle.Danger)
+    ));
 
     return { embeds: [embed], components: rows };
 }
@@ -834,15 +1248,11 @@ async function updateCallControlMessage(channelId, ownerId, isPrivate) {
     try {
         const channel = await client.channels.fetch(channelId).catch(() => null);
         if (!channel) return;
-
         const controlId = callInfoMessages.get(channelId);
         if (!controlId) return;
-
         const msg = await channel.messages.fetch(controlId).catch(() => null);
         if (!msg) return;
-
-        const payload = buildCallControlMessage(channelId, ownerId, isPrivate);
-        await msg.edit(payload).catch(() => {});
+        await msg.edit(buildCallControlMessage(channelId, ownerId, isPrivate)).catch(() => {});
     } catch (err) {
         console.error('Fout bij updaten call control message:', err);
     }
@@ -856,29 +1266,9 @@ async function createCall(interaction, name, isPrivate) {
 
     const overwrites = [
         { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-        {
-            id: CONFIG.VERIFY_ROLE_ID,
-            allow: [PermissionFlagsBits.ViewChannel],
-            deny: isPrivate ? [PermissionFlagsBits.Connect] : []
-        },
-        {
-            id: member.id,
-            allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.Connect,
-                PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.MoveMembers
-            ]
-        },
-        {
-            id: client.user.id,
-            allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.Connect,
-                PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.MoveMembers
-            ]
-        }
+        { id: CONFIG.VERIFY_ROLE_ID, allow: [PermissionFlagsBits.ViewChannel], deny: isPrivate ? [PermissionFlagsBits.Connect] : [] },
+        { id: member.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers] },
+        { id: client.user.id, allow: [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.ManageChannels, PermissionFlagsBits.MoveMembers] }
     ];
 
     const channel = await guild.channels.create({
@@ -889,22 +1279,13 @@ async function createCall(interaction, name, isPrivate) {
         reason: `Call van ${member.user.tag}`
     });
 
-    activeCalls.set(channel.id, {
-        ownerId: member.id,
-        isPrivate,
-        guildId: guild.id,
-        emptySince: Date.now()
-    });
+    activeCalls.set(channel.id, { ownerId: member.id, isPrivate, guildId: guild.id, emptySince: Date.now() });
     callAllowed.set(channel.id, new Set([member.id]));
 
     const controlMsg = await channel.send(buildCallControlMessage(channel.id, member.id, isPrivate)).catch(() => null);
-    if (controlMsg) {
-        callInfoMessages.set(channel.id, controlMsg.id);
-    }
+    if (controlMsg) callInfoMessages.set(channel.id, controlMsg.id);
 
-    const payload = buildCallInfoMessage(channel.id, member.id, isPrivate);
-    await interaction.editReply(payload).catch(() => {});
-
+    await interaction.editReply(buildCallInfoMessage(channel.id, member.id, isPrivate)).catch(() => {});
     await sendLog(guild, CONFIG.CALL_LOG_ID, {
         title: isPrivate ? '🔒 Privé call gemaakt' : '🔊 Openbare call gemaakt',
         description: `**Eigenaar:** ${member.user.tag} (\`${member.id}\`)\n**Kanaal:** <#${channel.id}>`,
@@ -927,110 +1308,30 @@ client.once('clientReady', async () => {
 
     try {
         const commands = [
-            new SlashCommandBuilder()
-                .setName('clear')
-                .setDescription('Verwijder een aantal berichten in dit kanaal')
-                .addIntegerOption(opt =>
-                    opt.setName('amount')
-                        .setDescription('Aantal berichten (1-100)')
-                        .setRequired(true)
-                        .setMinValue(1)
-                        .setMaxValue(100)
-                )
+            new SlashCommandBuilder().setName('clear').setDescription('Verwijder een aantal berichten in dit kanaal')
+                .addIntegerOption(o => o.setName('amount').setDescription('Aantal (1-100)').setRequired(true).setMinValue(1).setMaxValue(100))
                 .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
-            new SlashCommandBuilder()
-                .setName('antinuke')
-                .setDescription('Zet het anti-nuke systeem aan of uit')
-                .addStringOption(opt =>
-                    opt.setName('actie')
-                        .setDescription('enable of disable')
-                        .setRequired(true)
-                        .addChoices(
-                            { name: 'enable', value: 'enable' },
-                            { name: 'disable', value: 'disable' }
-                        )
-                ),
-            new SlashCommandBuilder()
-                .setName('refresh')
-                .setDescription('Werk de ledenlijst en het custom role panel bij'),
-            new SlashCommandBuilder()
-                .setName('customroles')
-                .setDescription('Vernieuw het custom role panel'),
-            new SlashCommandBuilder()
-                .setName('createbackup')
-                .setDescription('Maak een backup van de server (alleen voor toegestane users)'),
-            new SlashCommandBuilder()
-                .setName('loadbackup')
-                .setDescription('Laad een backup (alleen voor toegestane users)')
-                .addStringOption(opt =>
-                    opt.setName('id')
-                        .setDescription('Backup ID')
-                        .setRequired(true)
-                ),
-            new SlashCommandBuilder()
-                .setName('giveaway')
-                .setDescription('Start een giveaway (alleen voor giveaway managers)')
-                .addStringOption(opt =>
-                    opt.setName('prijs')
-                        .setDescription('Wat is de prijs?')
-                        .setRequired(true)
-                )
-                .addStringOption(opt =>
-                    opt.setName('duur')
-                        .setDescription('Duur: bijv. 10s, 1u, 1d, 2d')
-                        .setRequired(true)
-                )
-                .addIntegerOption(opt =>
-                    opt.setName('winnaars')
-                        .setDescription('Aantal winnaars (standaard 1)')
-                        .setRequired(false)
-                        .setMinValue(1)
-                        .setMaxValue(10)
-                ),
-            new SlashCommandBuilder()
-                .setName('resetgame')
-                .setDescription('Reset de huidige stand van een spel (highscore blijft bewaard)')
-                .addStringOption(opt =>
-                    opt.setName('game')
-                        .setDescription('Welk spel wil je resetten?')
-                        .setRequired(true)
-                        .addChoices(
-                            { name: 'Tel Spel', value: 'counting' }
-                        )
-                ),
-            new SlashCommandBuilder()
-                .setName('blackjack')
-                .setDescription('Speel blackjack in het casino')
-                .addIntegerOption(opt =>
-                    opt.setName('inzet')
-                        .setDescription('Hoeveel chips zet je in?')
-                        .setRequired(true)
-                        .setMinValue(1)
-                        .setMaxValue(10000)
-                ),
-            new SlashCommandBuilder()
-                .setName('roulette')
-                .setDescription('Speel roulette in het casino')
-                .addIntegerOption(opt =>
-                    opt.setName('inzet')
-                        .setDescription('Hoeveel chips zet je in?')
-                        .setRequired(true)
-                        .setMinValue(1)
-                        .setMaxValue(10000)
-                )
-                .addStringOption(opt =>
-                    opt.setName('kleur')
-                        .setDescription('Kies rood, zwart of groen')
-                        .setRequired(true)
-                        .addChoices(
-                            { name: 'rood', value: 'rood' },
-                            { name: 'zwart', value: 'zwart' },
-                            { name: 'groen', value: 'groen' }
-                        )
-                ),
-            new SlashCommandBuilder()
-                .setName('chips')
-                .setDescription('Bekijk hoeveel chips je hebt')
+            new SlashCommandBuilder().setName('antinuke').setDescription('Zet anti-nuke aan of uit')
+                .addStringOption(o => o.setName('actie').setDescription('enable of disable').setRequired(true).addChoices({ name: 'enable', value: 'enable' }, { name: 'disable', value: 'disable' })),
+            new SlashCommandBuilder().setName('refresh').setDescription('Werk de ledenlijst en custom role panel bij'),
+            new SlashCommandBuilder().setName('customroles').setDescription('Vernieuw het custom role panel'),
+            new SlashCommandBuilder().setName('createbackup').setDescription('Maak een backup (alleen voor toegestane users)'),
+            new SlashCommandBuilder().setName('loadbackup').setDescription('Laad een backup')
+                .addStringOption(o => o.setName('id').setDescription('Backup ID').setRequired(true)),
+            new SlashCommandBuilder().setName('giveaway').setDescription('Start een giveaway')
+                .addStringOption(o => o.setName('prijs').setDescription('Prijs').setRequired(true))
+                .addStringOption(o => o.setName('duur').setDescription('Duur: 10s, 1u, 1d, 2d').setRequired(true))
+                .addIntegerOption(o => o.setName('winnaars').setDescription('Aantal winnaars').setRequired(false).setMinValue(1).setMaxValue(10)),
+            new SlashCommandBuilder().setName('resetgame').setDescription('Reset de huidige stand van een spel')
+                .addStringOption(o => o.setName('game').setDescription('Welk spel?').setRequired(true).addChoices({ name: 'Tel Spel', value: 'counting' })),
+            new SlashCommandBuilder().setName('blackjack').setDescription('Speel blackjack')
+                .addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)),
+            new SlashCommandBuilder().setName('roulette').setDescription('Speel roulette')
+                .addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000))
+                .addStringOption(o => o.setName('kleur').setDescription('rood, zwart of groen').setRequired(true).addChoices({ name: 'rood', value: 'rood' }, { name: 'zwart', value: 'zwart' }, { name: 'groen', value: 'groen' })),
+            new SlashCommandBuilder().setName('crasher').setDescription('Speel crasher')
+                .addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)),
+            new SlashCommandBuilder().setName('chips').setDescription('Bekijk je chips')
         ].map(c => c.toJSON());
         await client.application.commands.set(commands);
         console.log('Slash commands geregistreerd');
@@ -1038,7 +1339,6 @@ client.once('clientReady', async () => {
         console.error('Fout bij registreren commands:', err);
     }
 
-    // Verify panel
     try {
         const verifyChannel = await client.channels.fetch(CONFIG.VERIFY_CHANNEL_ID);
         if (verifyChannel) {
@@ -1046,24 +1346,17 @@ client.once('clientReady', async () => {
             const verifyCount = await countRoleMembers(verifyChannel.guild, CONFIG.VERIFY_ROLE_ID, true);
             const embed = new EmbedBuilder()
                 .setTitle('Familie Snus Verification')
-                .setDescription('Welkom bij Familie Snus!\n\nKlik op de knop hieronder om jezelf te verifiëren en toegang te krijgen tot de server.')
+                .setDescription('Welkom bij Familie Snus!\n\nKlik op de knop hieronder om jezelf te verifiëren.')
                 .setColor(PURPLE.main)
                 .setThumbnail(CONFIG.LOGO_URL);
-            const button = new ButtonBuilder()
-                .setCustomId(CONFIG.VERIFY_BUTTON_ID)
-                .setLabel(`${verifyCount}`)
-                .setEmoji('✅')
-                .setStyle(ButtonStyle.Success);
+            const button = new ButtonBuilder().setCustomId(CONFIG.VERIFY_BUTTON_ID).setLabel(`${verifyCount}`).setEmoji('✅').setStyle(ButtonStyle.Success);
             const row = new ActionRowBuilder().addComponents(button);
             await verifyChannel.send({ embeds: [embed], components: [row] });
         }
-    } catch (err) {
-        console.error('Fout bij verify panel:', err);
-    }
+    } catch (err) {}
 
     await new Promise(r => setTimeout(r, 5000));
 
-    // Snapchat panel
     try {
         const snapChannel = await client.channels.fetch(CONFIG.SNAP_CHANNEL_ID);
         if (snapChannel) {
@@ -1071,83 +1364,46 @@ client.once('clientReady', async () => {
             const snapCount = await countRoleMembers(snapChannel.guild, CONFIG.SNAP_ROLE_ID, false);
             const embed = new EmbedBuilder()
                 .setTitle('Snapchat Ping')
-                .setDescription(
-                    'Klik op de knop hieronder om de **Snapchat Ping** rol te krijgen.\n\n' +
-                    'Je krijgt dan een ping wanneer er snaps gedropped worden.'
-                )
+                .setDescription('Klik op de knop hieronder om de **Snapchat Ping** rol te krijgen.\n\nJe krijgt dan een ping wanneer er snaps gedropped worden.')
                 .setColor(PURPLE.main)
                 .setThumbnail(CONFIG.LOGO_URL);
-            const button = new ButtonBuilder()
-                .setCustomId(CONFIG.SNAP_BUTTON_ID)
-                .setLabel(`${snapCount}`)
-                .setEmoji('👻')
-                .setStyle(ButtonStyle.Primary);
+            const button = new ButtonBuilder().setCustomId(CONFIG.SNAP_BUTTON_ID).setLabel(`${snapCount}`).setEmoji('👻').setStyle(ButtonStyle.Primary);
             const row = new ActionRowBuilder().addComponents(button);
             await snapChannel.send({ embeds: [embed], components: [row] });
         }
-    } catch (err) {
-        console.error('Fout bij snapchat panel:', err);
-    }
+    } catch (err) {}
 
-    // Honeypot
     try {
         const honeyChannel = await client.channels.fetch(CONFIG.HONEYPOT_CHANNEL_ID);
         if (honeyChannel) {
             await clearChannel(honeyChannel);
             await honeyChannel.send({ embeds: [buildHoneypotEmbed()] });
         }
-    } catch (err) {
-        console.error('Fout bij honeypot panel:', err);
-    }
+    } catch (err) {}
 
-    // Call panel
     try {
         const callChannel = await client.channels.fetch(CONFIG.CALL_CHANNEL_ID);
         if (callChannel) {
             await cleanupOldPanels(callChannel, 'Maak een call aan');
             await callChannel.send(buildCallPanel());
         }
-    } catch (err) {
-        console.error('Fout bij call panel:', err);
-    }
+    } catch (err) {}
 
-    // Counting game paneel
+    // Counting paneel
     try {
         const countingChannel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID);
         if (countingChannel) {
             const state = countingState[countingChannel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
             if (!state.highScore) state.highScore = 0;
             countingState[countingChannel.id] = state;
-
-            const payload = {
-                embeds: [new EmbedBuilder()
-                    .setTitle('🔢 Tel-spel')
-                    .setDescription(
-                        `**Huidige stand:** ${state.current}\n` +
-                        `**Highscore:** ${state.highScore}\n\n` +
-                        '**Regels:**\n' +
-                        '• Typ het juiste volgende getal.\n' +
-                        '• Je mag niet 2x achter elkaar typen.\n' +
-                        '• Typ je iets anders of fout, dan begint het spel opnieuw bij 1.'
-                    )
-                    .setColor(PURPLE.main)
-                    .setThumbnail(CONFIG.LOGO_URL)
-                    .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-                    .setTimestamp()]
-            };
-
-            const sent = await countingChannel.send(payload);
+            const sent = await countingChannel.send({ embeds: [buildCountingEmbed(state)] });
             state.lastMessageId = sent.id;
             countingState[countingChannel.id] = state;
         }
-    } catch (err) {
-        console.error('Fout bij tel-spel paneel:', err);
-    }
+    } catch (err) {}
 
-    // Casino panel + leaderboard
     await updateCasinoPanel();
     await updateCasinoLeaderboard();
-
     await updateMembersList();
     await updateCustomRolePanel();
 
@@ -1156,10 +1412,10 @@ client.once('clientReady', async () => {
     }
 
     setInterval(checkEmptyCalls, CONFIG.EMPTY_CALL_CHECK_MS);
-    console.log(`Lege-call checker gestart (elke ${CONFIG.EMPTY_CALL_CHECK_MS / 60000} min, timeout ${CONFIG.EMPTY_CALL_TIMEOUT_MS / 60000} min)`);
+    console.log(`Bot is klaar.`);
 });
 
-// --- WELCOME + DM + JOIN LOG ---
+// --- MEMBER EVENTS ---
 client.on('guildMemberAdd', async (member) => {
     updateStatus(member.guild);
     scheduleMembersUpdate();
@@ -1172,27 +1428,18 @@ client.on('guildMemberAdd', async (member) => {
         if (channel) {
             const memberCount = member.guild.memberCount;
             const embed = new EmbedBuilder()
-                .setDescription(
-                    `Welkom ${member}!\n` +
-                    `Je bent lid **${memberCount}** van **${CONFIG.SERVER_NAME}**.`
-                )
+                .setDescription(`Welkom ${member}!\nJe bent lid **${memberCount}** van **${CONFIG.SERVER_NAME}**.`)
                 .setThumbnail(member.user.displayAvatarURL({ dynamic: true, size: 128 }))
                 .setColor(PURPLE.main)
                 .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
             await channel.send({ embeds: [embed] }).catch(() => {});
         }
-    } catch (err) {
-        console.error('Fout bij welcome:', err);
-    }
+    } catch (err) {}
 
     try {
         const dmEmbed = new EmbedBuilder()
             .setTitle(`Welkom bij ${CONFIG.SERVER_NAME}!`)
-            .setDescription(
-                `Hey ${member.user.username}!\n\n` +
-                `Leuk dat je er bent. Verifieer jezelf in <#${CONFIG.VERIFY_CHANNEL_ID}> om toegang te krijgen tot de server.\n\n` +
-                `Als je vragen hebt, kan je altijd een admin aanspreken.`
-            )
+            .setDescription(`Hey ${member.user.username}!\n\nLeuk dat je er bent. Verifieer jezelf in <#${CONFIG.VERIFY_CHANNEL_ID}>.`)
             .setColor(PURPLE.main)
             .setThumbnail(CONFIG.LOGO_URL);
         await member.send({ embeds: [dmEmbed] });
@@ -1200,10 +1447,7 @@ client.on('guildMemberAdd', async (member) => {
 
     await sendLog(member.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
         title: '📥 Lid gejoint',
-        description:
-            `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n` +
-            `**Account aangemaakt:** <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>\n` +
-            `**Leden nu:** ${member.guild.memberCount}`,
+        description: `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n**Account aangemaakt:** <t:${Math.floor(member.user.createdTimestamp / 1000)}:R>\n**Leden nu:** ${member.guild.memberCount}`,
         color: PURPLE.main,
         thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
     });
@@ -1226,11 +1470,7 @@ client.on('guildMemberRemove', async (member) => {
 
     await sendLog(member.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
         title: '📤 Lid verlaten',
-        description:
-            `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n` +
-            `**In server voor:** ${durationText}\n` +
-            `**Had verify:** ${hadVerify ? 'ja' : 'nee'}\n` +
-            `**Had snapchat ping:** ${hadSnap ? 'ja' : 'nee'}`,
+        description: `**Gebruiker:** ${member.user.tag} (\`${member.id}\`)\n**In server voor:** ${durationText}\n**Had verify:** ${hadVerify ? 'ja' : 'nee'}\n**Had snapchat ping:** ${hadSnap ? 'ja' : 'nee'}`,
         color: PURPLE.dark,
         thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
     });
@@ -1266,17 +1506,11 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
     let rankChanged = false;
     for (const rank of FIXED_RANKS) {
-        if (oldMember.roles.cache.has(rank.roleId) !== newMember.roles.cache.has(rank.roleId)) {
-            rankChanged = true;
-            break;
-        }
+        if (oldMember.roles.cache.has(rank.roleId) !== newMember.roles.cache.has(rank.roleId)) { rankChanged = true; break; }
     }
     if (!rankChanged) {
         for (const cr of customRoles) {
-            if (oldMember.roles.cache.has(cr.roleId) !== newMember.roles.cache.has(cr.roleId)) {
-                rankChanged = true;
-                break;
-            }
+            if (oldMember.roles.cache.has(cr.roleId) !== newMember.roles.cache.has(cr.roleId)) { rankChanged = true; break; }
         }
     }
     if (rankChanged) scheduleMembersUpdate();
@@ -1293,10 +1527,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
         try {
             const dmEmbed = new EmbedBuilder()
                 .setTitle(`Je bent geverifieerd!`)
-                .setDescription(
-                    `Bedankt voor het verifiëren bij **${CONFIG.SERVER_NAME}**!\n\n` +
-                    `Je hebt nu toegang tot de server. Veel plezier! 🎉`
-                )
+                .setDescription(`Bedankt voor het verifiëren bij **${CONFIG.SERVER_NAME}**!\n\nJe hebt nu toegang tot de server. Veel plezier! 🎉`)
                 .setColor(PURPLE.main)
                 .setThumbnail(CONFIG.LOGO_URL);
             await newMember.send({ embeds: [dmEmbed] });
@@ -1333,24 +1564,20 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     }
 });
 
-// --- ANTI-NUKE HELPERS ---
+// --- ANTI-NUKE ---
 function checkThreshold(userId, type) {
     const key = `${userId}:${type}`;
     const now = Date.now();
     const list = (actionTracker.get(key) || []).filter(t => now - t < CONFIG.ANTINUKE_WINDOW_MS);
     list.push(now);
     actionTracker.set(key, list);
-    const limit = CONFIG.ANTINUKE_LIMITS[type] || 999;
-    return list.length >= limit;
+    return list.length >= (CONFIG.ANTINUKE_LIMITS[type] || 999);
 }
 
 async function findExecutor(guild, type, targetId) {
     try {
         const logs = await guild.fetchAuditLogs({ type, limit: 5 });
-        const entry = logs.entries.find(e =>
-            (!targetId || e.target?.id === targetId) &&
-            Date.now() - e.createdTimestamp < 15000
-        );
+        const entry = logs.entries.find(e => (!targetId || e.target?.id === targetId) && Date.now() - e.createdTimestamp < 15000);
         return entry ? entry.executor : null;
     } catch (err) {
         return null;
@@ -1361,12 +1588,8 @@ async function punishUser(guild, userId, reason) {
     try {
         const member = await guild.members.fetch(userId).catch(() => null);
         if (!member) return;
-        const removable = member.roles.cache.filter(r =>
-            r.id !== guild.id && guild.members.me.roles.highest.position > r.position
-        );
-        if (removable.size > 0) {
-            await member.roles.remove(removable, `Anti-nuke: ${reason}`).catch(() => {});
-        }
+        const removable = member.roles.cache.filter(r => r.id !== guild.id && guild.members.me.roles.highest.position > r.position);
+        if (removable.size > 0) await member.roles.remove(removable, `Anti-nuke: ${reason}`).catch(() => {});
         await member.kick(`Anti-nuke: ${reason}`).catch(() => {});
         await sendLog(guild, CONFIG.JOIN_LEAVE_LOG_ID, {
             title: '🚨 Anti-nuke actie',
@@ -1374,36 +1597,22 @@ async function punishUser(guild, userId, reason) {
             color: PURPLE.dark,
             thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
         });
-    } catch (err) {
-        console.error('Fout bij straffen user:', err);
-    }
+    } catch (err) {}
 }
 
 async function handleNukeAction(guild, type, targetId) {
     if (!antinukeData.enabled) return;
     const executor = await findExecutor(guild, type, targetId);
-    if (!executor) return;
-    if (executor.id === client.user.id) return;
+    if (!executor || executor.id === client.user.id) return;
     if (CONFIG.ANTINUKE_ALLOWED_USERS.includes(executor.id)) return;
-    if (checkThreshold(executor.id, type)) {
-        await punishUser(guild, executor.id, `Te veel ${type} acties binnen ${CONFIG.ANTINUKE_WINDOW_MS / 1000}s`);
-    }
+    if (checkThreshold(executor.id, type)) await punishUser(guild, executor.id, `Te veel ${type} acties`);
 }
 
-client.on('channelDelete', async (channel) => {
-    if (!channel.guild) return;
-    await handleNukeAction(channel.guild, 'channelDelete', channel.id);
-});
+client.on('channelDelete', async (channel) => { if (channel.guild) await handleNukeAction(channel.guild, 'channelDelete', channel.id); });
+client.on('roleDelete', async (role) => { if (role.guild) await handleNukeAction(role.guild, 'roleDelete', role.id); });
+client.on('guildBanAdd', async (ban) => { await handleNukeAction(ban.guild, 'banAdd', ban.user.id); });
 
-client.on('roleDelete', async (role) => {
-    if (!role.guild) return;
-    await handleNukeAction(role.guild, 'roleDelete', role.id);
-});
-
-client.on('guildBanAdd', async (ban) => {
-    await handleNukeAction(ban.guild, 'banAdd', ban.user.id);
-});
-
+// --- MESSAGES ---
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
 
@@ -1412,35 +1621,18 @@ client.on('messageCreate', async (message) => {
         const member = message.member;
         if (!member) return;
         try {
-            await member.kick('Honeypot kanaal - bericht geplaatst');
+            await member.kick('Honeypot kanaal');
             kickData.total += 1;
             await saveToGist();
             await refreshHoneypotEmbed(message.channel);
-            const embed = new EmbedBuilder()
-                .setTitle('🍯 Honeypot geactiveerd')
-                .setDescription(
-                    `**Gebruiker:** ${message.author.tag} (\`${message.author.id}\`)\n` +
-                    `**Actie:** KICK\n` +
-                    `**Totaal aantal kicks:** ${kickData.total}`
-                )
-                .setColor(PURPLE.dark)
-                .setTimestamp();
-            await message.channel.send({ embeds: [embed] }).catch(() => {});
-
+            await message.channel.send({ embeds: [new EmbedBuilder().setTitle('🍯 Honeypot geactiveerd').setDescription(`**Gebruiker:** ${message.author.tag} (\`${message.author.id}\`)\n**Actie:** KICK\n**Totaal aantal kicks:** ${kickData.total}`).setColor(PURPLE.dark).setTimestamp()] }).catch(() => {});
             await sendLog(message.guild, CONFIG.HONEYPOT_LOG_ID, {
                 title: '🍯 Honeypot kick',
-                description:
-                    `**Gebruiker:** ${message.author.tag} (\`${message.author.id}\`)\n` +
-                    `**Actie:** KICK\n` +
-                    `**Kanaal:** <#${CONFIG.HONEYPOT_CHANNEL_ID}>\n` +
-                    `**Totaal aantal kicks:** ${kickData.total}\n` +
-                    `**Bericht:** ${message.content ? message.content.slice(0, 200) : '_Geen tekst_'}`,
+                description: `**Gebruiker:** ${message.author.tag} (\`${message.author.id}\`)\n**Actie:** KICK\n**Kanaal:** <#${CONFIG.HONEYPOT_CHANNEL_ID}>\n**Totaal aantal kicks:** ${kickData.total}`,
                 color: PURPLE.dark,
                 thumbnail: message.author.displayAvatarURL({ dynamic: true, size: 128 })
             });
-        } catch (err) {
-            console.error('Fout bij honeypot kick:', err);
-        }
+        } catch (err) {}
         return;
     }
 
@@ -1451,20 +1643,11 @@ client.on('messageCreate', async (message) => {
 
     if (message.guild) {
         const protectedChannels = [
-            CONFIG.HONEYPOT_CHANNEL_ID,
-            CONFIG.HONEYPOT_LOG_ID,
-            CONFIG.VERIFY_LOG_ID,
-            CONFIG.SNAP_LOG_ID,
-            CONFIG.CALL_LOG_ID,
-            CONFIG.JOIN_LEAVE_LOG_ID,
-            CONFIG.MEMBERS_LIST_CHANNEL_ID,
-            CONFIG.CUSTOM_ROLE_PANEL_CHANNEL_ID,
-            CONFIG.GIVEAWAY_CHANNEL_ID,
-            CONFIG.GIVEAWAY_LOG_ID,
-            CONFIG.ROLE_MANAGER_LOG_ID,
-            CONFIG.COUNTING_CHANNEL_ID,
-            CONFIG.CASINO_CHANNEL_ID,
-            CONFIG.CASINO_LEADERBOARD_CHANNEL_ID
+            CONFIG.HONEYPOT_CHANNEL_ID, CONFIG.HONEYPOT_LOG_ID, CONFIG.VERIFY_LOG_ID,
+            CONFIG.SNAP_LOG_ID, CONFIG.CALL_LOG_ID, CONFIG.JOIN_LEAVE_LOG_ID,
+            CONFIG.MEMBERS_LIST_CHANNEL_ID, CONFIG.CUSTOM_ROLE_PANEL_CHANNEL_ID,
+            CONFIG.GIVEAWAY_CHANNEL_ID, CONFIG.GIVEAWAY_LOG_ID, CONFIG.ROLE_MANAGER_LOG_ID,
+            CONFIG.COUNTING_CHANNEL_ID, CONFIG.CASINO_CHANNEL_ID, CONFIG.CASINO_LEADERBOARD_CHANNEL_ID
         ];
         if (!protectedChannels.includes(message.channel.id)) {
             const deleted = await handleAntiLink(message);
@@ -1473,23 +1656,17 @@ client.on('messageCreate', async (message) => {
     }
 });
 
+// --- VOICE ---
 client.on('voiceStateUpdate', async (oldState, newState) => {
     const channelId = oldState.channelId || newState.channelId;
-    if (!channelId) return;
-    if (!activeCalls.has(channelId)) return;
-
+    if (!channelId || !activeCalls.has(channelId)) return;
     const call = activeCalls.get(channelId);
     if (!call) return;
-
     const channel = newState.guild.channels.cache.get(channelId) || oldState.guild.channels.cache.get(channelId);
     if (!channel) return;
 
     if (oldState.channelId === channelId && newState.channelId !== channelId && oldState.id === call.ownerId) {
-        try {
-            await channel.delete('Call eigenaar heeft de call verlaten').catch(() => {});
-        } catch (err) {
-            console.error('Fout bij verwijderen call:', err);
-        }
+        await channel.delete('Call eigenaar heeft de call verlaten').catch(() => {});
         activeCalls.delete(channelId);
         callAllowed.delete(channelId);
         callInfoMessages.delete(channelId);
@@ -1497,11 +1674,8 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     }
 
     const members = channel.members.filter(m => !m.user.bot);
-    if (members.size === 0) {
-        if (!call.emptySince) call.emptySince = Date.now();
-    } else {
-        call.emptySince = null;
-    }
+    if (members.size === 0) { if (!call.emptySince) call.emptySince = Date.now(); }
+    else call.emptySince = null;
     activeCalls.set(channelId, call);
 });
 
@@ -1510,308 +1684,129 @@ async function checkEmptyCalls() {
     for (const [channelId, call] of activeCalls.entries()) {
         try {
             const channel = await client.channels.fetch(channelId).catch(() => null);
-            if (!channel) {
-                activeCalls.delete(channelId);
-                callAllowed.delete(channelId);
-                callInfoMessages.delete(channelId);
-                continue;
-            }
-
+            if (!channel) { activeCalls.delete(channelId); callAllowed.delete(channelId); callInfoMessages.delete(channelId); continue; }
             const members = channel.members.filter(m => !m.user.bot);
-            if (members.size > 0) {
-                call.emptySince = null;
-                activeCalls.set(channelId, call);
-                continue;
-            }
-
-            if (!call.emptySince) {
-                call.emptySince = now;
-                activeCalls.set(channelId, call);
-                continue;
-            }
-
+            if (members.size > 0) { call.emptySince = null; activeCalls.set(channelId, call); continue; }
+            if (!call.emptySince) { call.emptySince = now; activeCalls.set(channelId, call); continue; }
             if (now - call.emptySince >= CONFIG.EMPTY_CALL_TIMEOUT_MS) {
                 await channel.delete('Call was leeg voor 1 uur').catch(() => {});
-                activeCalls.delete(channelId);
-                callAllowed.delete(channelId);
-                callInfoMessages.delete(channelId);
-                console.log(`Lege call verwijderd: ${channelId}`);
+                activeCalls.delete(channelId); callAllowed.delete(channelId); callInfoMessages.delete(channelId);
             }
-        } catch (err) {
-            console.error('Fout bij check lege call:', err);
-        }
+        } catch (err) {}
     }
 }
 
+// --- INTERACTIONS ---
 client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'clear') {
             const amount = interaction.options.getInteger('amount');
-            if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om dit te doen.', flags: MessageFlags.Ephemeral });
-            }
-            try {
-                await interaction.channel.bulkDelete(amount, true);
-                await interaction.reply({ content: `${amount} berichten verwijderd.`, flags: MessageFlags.Ephemeral });
-            } catch (err) {
-                console.error('Fout bij clear:', err);
-                await interaction.reply({ content: 'Kon de berichten niet verwijderen.', flags: MessageFlags.Ephemeral });
-            }
+            if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
+            try { await interaction.channel.bulkDelete(amount, true); await interaction.reply({ content: `${amount} berichten verwijderd.`, flags: MessageFlags.Ephemeral }); }
+            catch (err) { await interaction.reply({ content: 'Kon niet verwijderen.', flags: MessageFlags.Ephemeral }); }
         }
 
         if (interaction.commandName === 'antinuke') {
-            if (!CONFIG.ANTINUKE_ALLOWED_USERS.includes(interaction.user.id)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om dit te gebruiken.', flags: MessageFlags.Ephemeral });
-            }
+            if (!CONFIG.ANTINUKE_ALLOWED_USERS.includes(interaction.user.id)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             const actie = interaction.options.getString('actie');
             if (actie === 'enable') {
-                if (antinukeData.enabled) {
-                    return interaction.reply({ content: 'Anti-nuke is al ingeschakeld.', flags: MessageFlags.Ephemeral });
-                }
+                if (antinukeData.enabled) return interaction.reply({ content: 'Al ingeschakeld.', flags: MessageFlags.Ephemeral });
                 antinukeData.enabled = true;
                 await saveToGist();
-                await sendLog(interaction.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
-                    title: '🛡️ Anti-nuke ingeschakeld',
-                    description: `Ingeschakeld door ${interaction.user.tag}.`,
-                    color: PURPLE.main
-                });
-                return interaction.reply({ content: 'Anti-nuke is nu **ingeschakeld**.', flags: MessageFlags.Ephemeral });
+                return interaction.reply({ content: 'Anti-nuke **ingeschakeld**.', flags: MessageFlags.Ephemeral });
             }
             if (actie === 'disable') {
-                if (!antinukeData.enabled) {
-                    return interaction.reply({ content: 'Anti-nuke is al uitgeschakeld.', flags: MessageFlags.Ephemeral });
-                }
+                if (!antinukeData.enabled) return interaction.reply({ content: 'Al uitgeschakeld.', flags: MessageFlags.Ephemeral });
                 antinukeData.enabled = false;
                 await saveToGist();
-                await sendLog(interaction.guild, CONFIG.JOIN_LEAVE_LOG_ID, {
-                    title: '🛡️ Anti-nuke uitgeschakeld',
-                    description: `Uitgeschakeld door ${interaction.user.tag}.`,
-                    color: PURPLE.dark
-                });
-                return interaction.reply({ content: 'Anti-nuke is nu **uitgeschakeld**.', flags: MessageFlags.Ephemeral });
+                return interaction.reply({ content: 'Anti-nuke **uitgeschakeld**.', flags: MessageFlags.Ephemeral });
             }
         }
 
         if (interaction.commandName === 'refresh') {
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-            try {
-                await updateMembersList();
-                await updateCustomRolePanel();
-                await interaction.editReply({ content: '✅ Ledenlijst en custom role panel bijgewerkt.' });
-            } catch (err) {
-                console.error('Fout bij refresh:', err);
-                await interaction.editReply({ content: '❌ Kon niet bijwerken.' });
-            }
+            await updateMembersList();
+            await updateCustomRolePanel();
+            return interaction.editReply({ content: '✅ Bijgewerkt.' });
         }
 
         if (interaction.commandName === 'customroles') {
-            if (!isCustomRoleManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om dit te gebruiken.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-            try {
-                await migrateDefaultCustomRoles();
-                await updateCustomRolePanel();
-                await interaction.editReply({ content: '✅ Custom role panel vernieuwd.' });
-            } catch (err) {
-                console.error('Fout bij customroles:', err);
-                await interaction.editReply({ content: '❌ Kon panel niet vernieuwen.' });
-            }
+            await migrateDefaultCustomRoles();
+            await updateCustomRolePanel();
+            return interaction.editReply({ content: '✅ Vernieuwd.' });
         }
 
         if (interaction.commandName === 'createbackup') {
-            if (!isBackupManager(interaction.user.id)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om dit te gebruiken.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isBackupManager(interaction.user.id)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+            const backupId = await createBackup(interaction.guild, interaction.user);
             try {
-                const backupId = await createBackup(interaction.guild, interaction.user);
-                try {
-                    const dmEmbed = new EmbedBuilder()
-                        .setTitle('✅ Backup aangemaakt')
-                        .setDescription(
-                            `Je backup is klaar.\n\n` +
-                            `**Backup ID:** \`${backupId}\`\n\n` +
-                            `Bewaar deze code goed. Je kan hem gebruiken met \`/loadbackup id:${backupId}\`.`
-                        )
-                        .setColor(PURPLE.main)
-                        .setThumbnail(CONFIG.LOGO_URL);
-                    await interaction.user.send({ embeds: [dmEmbed] });
-                } catch (err) {
-                    console.log('Kon geen DM sturen naar user.');
-                }
-                await interaction.editReply({ content: `✅ Backup aangemaakt. De code is in je DM gestuurd.` });
-            } catch (err) {
-                console.error('Fout bij createbackup:', err);
-                await interaction.editReply({ content: `❌ Kon backup niet maken: ${err.message}` });
-            }
+                await interaction.user.send({ embeds: [new EmbedBuilder().setTitle('✅ Backup').setDescription(`**ID:** \`${backupId}\``).setColor(PURPLE.main)] });
+            } catch (err) {}
+            return interaction.editReply({ content: `✅ Backup gemaakt. Code in DM.` });
         }
 
         if (interaction.commandName === 'loadbackup') {
-            if (!isBackupManager(interaction.user.id)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om dit te gebruiken.', flags: MessageFlags.Ephemeral });
-            }
-            const backupId = interaction.options.getString('id').toUpperCase();
-            if (!backups[backupId]) {
-                return interaction.reply({ content: `❌ Backup \`${backupId}\` niet gevonden.`, flags: MessageFlags.Ephemeral });
-            }
+            if (!isBackupManager(interaction.user.id)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
+            const id = interaction.options.getString('id').toUpperCase();
+            if (!backups[id]) return interaction.reply({ content: 'Backup niet gevonden.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-            try {
-                const result = await loadBackup(interaction.guild, backupId);
-                const embed = new EmbedBuilder()
-                    .setTitle('✅ Backup geladen')
-                    .setDescription(
-                        `**Backup ID:** \`${backupId}\`\n\n` +
-                        `**Rollen aangemaakt:** ${result.rolesCreated}\n` +
-                        `**Rollen bijgewerkt:** ${result.rolesUpdated}\n` +
-                        `**Categorieën aangemaakt:** ${result.categoriesCreated}\n` +
-                        `**Kanalen aangemaakt:** ${result.channelsCreated}\n` +
-                        `**Kanalen bijgewerkt:** ${result.channelsUpdated}\n\n` +
-                        (result.errors.length > 0
-                            ? `**Fouten:**\n${result.errors.slice(0, 10).map(e => `- ${e}`).join('\n')}`
-                            : '_Geen fouten._')
-                    )
-                    .setColor(PURPLE.main)
-                    .setThumbnail(CONFIG.LOGO_URL);
-                await interaction.editReply({ embeds: [embed] });
-            } catch (err) {
-                console.error('Fout bij loadbackup:', err);
-                await interaction.editReply({ content: `❌ Kon backup niet laden: ${err.message}` });
-            }
+            const result = await loadBackup(interaction.guild, id);
+            return interaction.editReply({ content: `✅ Geladen. Rollen: ${result.rolesCreated}, kanalen: ${result.channelsCreated}.` });
         }
 
         if (interaction.commandName === 'giveaway') {
-            if (!isGiveawayManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om dit te gebruiken.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isGiveawayManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             const prize = interaction.options.getString('prijs');
-            const duurInput = interaction.options.getString('duur');
+            const durationInput = interaction.options.getString('duur');
             const winnersCount = interaction.options.getInteger('winnaars') || 1;
-
-            const durationMs = parseDurationInput(duurInput);
-            if (!durationMs) {
-                return interaction.reply({
-                    content: '❌ Ongeldige duur. Gebruik bijv. `10s`, `1u`, `1d`, `2d`.',
-                    flags: MessageFlags.Ephemeral
-                });
-            }
-
+            const durationMs = parseDurationInput(durationInput);
+            if (!durationMs) return interaction.reply({ content: 'Ongeldige duur.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-            try {
-                const channel = await client.channels.fetch(CONFIG.GIVEAWAY_CHANNEL_ID);
-                if (!channel || !channel.isTextBased()) {
-                    return interaction.editReply({ content: '❌ Giveaway kanaal niet gevonden.' });
-                }
-
-                const endsAt = Date.now() + durationMs;
-
-                const gwData = {
-                    channelId: CONFIG.GIVEAWAY_CHANNEL_ID,
-                    prize,
-                    endsAt,
-                    winnersCount,
-                    participants: [],
-                    winners: [],
-                    ended: false,
-                    hostId: interaction.user.id
-                };
-
-                const tempEmbed = new EmbedBuilder()
-                    .setTitle('🎉 Giveaway')
-                    .setDescription(
-                        `**Prijs:** ${prize}\n\n` +
-                        `**Eindigt:** <t:${Math.floor(endsAt / 1000)}:R>\n**Deelnemers:** 0`
-                    )
-                    .setColor(PURPLE.main)
-                    .setThumbnail(CONFIG.LOGO_URL)
-                    .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-                    .setTimestamp();
-
-                const sent = await channel.send({ embeds: [tempEmbed] });
-                gwData.messageId = sent.id;
-                giveaways[sent.id] = gwData;
-                await saveToGist();
-
-                await sent.edit({
-                    embeds: [buildGiveawayEmbed(gwData)],
-                    components: buildGiveawayRows(sent.id, false)
-                });
-
-                startGiveawayTimer(sent.id);
-
-                await interaction.editReply({ content: `✅ Giveaway gestart in <#${CONFIG.GIVEAWAY_CHANNEL_ID}>.` });
-
-                await sendLog(interaction.guild, CONFIG.GIVEAWAY_LOG_ID, {
-                    title: '🎉 Giveaway gestart',
-                    description:
-                        `**Prijs:** ${prize}\n` +
-                        `**Duur:** ${duurInput}\n` +
-                        `**Winnaars:** ${winnersCount}\n` +
-                        `**Kanaal:** <#${CONFIG.GIVEAWAY_CHANNEL_ID}>\n` +
-                        `**Door:** ${interaction.user.tag} (\`${interaction.user.id}\`)`,
-                    color: PURPLE.main,
-                    thumbnail: interaction.user.displayAvatarURL({ dynamic: true, size: 128 })
-                });
-            } catch (err) {
-                console.error('Fout bij giveaway:', err);
-                await interaction.editReply({ content: `❌ Kon giveaway niet starten: ${err.message}` });
-            }
+            const channel = await client.channels.fetch(CONFIG.GIVEAWAY_CHANNEL_ID);
+            const endsAt = Date.now() + durationMs;
+            const gwData = { channelId: CONFIG.GIVEAWAY_CHANNEL_ID, prize, endsAt, winnersCount, participants: [], winners: [], ended: false, hostId: interaction.user.id };
+            const sent = await channel.send({ embeds: [buildGiveawayEmbed(gwData)] });
+            gwData.messageId = sent.id;
+            giveaways[sent.id] = gwData;
+            await saveToGist();
+            await sent.edit({ embeds: [buildGiveawayEmbed(gwData)], components: buildGiveawayRows(sent.id, false) });
+            startGiveawayTimer(sent.id);
+            return interaction.editReply({ content: `✅ Giveaway in <#${CONFIG.GIVEAWAY_CHANNEL_ID}>.` });
         }
 
         if (interaction.commandName === 'resetgame') {
             const game = interaction.options.getString('game');
-
             if (game === 'counting') {
-                if (!isCustomRoleManager(interaction)) {
-                    return interaction.reply({ content: 'Je hebt geen toestemming om dit te doen.', flags: MessageFlags.Ephemeral });
-                }
-
+                if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
                 await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-                const state = countingState[CONFIG.COUNTING_CHANNEL_ID] || {
-                    current: 0,
-                    lastUserId: null,
-                    highScore: 0,
-                    lastMessageId: null
-                };
+                const state = countingState[CONFIG.COUNTING_CHANNEL_ID] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
                 state.current = 0;
                 state.lastUserId = null;
                 countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
                 await saveToGist();
-
-                return interaction.editReply({ content: '✅ Tel-spel is gereset. De highscore blijft bewaard.' });
+                await updateCountingEmbed(state);
+                return interaction.editReply({ content: '✅ Tel-spel gereset. Highscore bewaard.' });
             }
-
-            return interaction.reply({ content: '❌ Onbekend spel.', flags: MessageFlags.Ephemeral });
+            return interaction.reply({ content: 'Onbekend spel.', flags: MessageFlags.Ephemeral });
         }
 
-        if (interaction.commandName === 'blackjack') {
-            const bet = interaction.options.getInteger('inzet');
-            await playBlackjack(interaction, bet);
-        }
-
-        if (interaction.commandName === 'roulette') {
-            const bet = interaction.options.getInteger('inzet');
-            const choice = interaction.options.getString('kleur');
-            await playRoulette(interaction, bet, choice);
-        }
+        if (interaction.commandName === 'blackjack') return playBlackjack(interaction, interaction.options.getInteger('inzet'));
+        if (interaction.commandName === 'roulette') return playRoulette(interaction, interaction.options.getInteger('inzet'), interaction.options.getString('kleur'));
+        if (interaction.commandName === 'crasher') return playCrasher(interaction, interaction.options.getInteger('inzet'));
 
         if (interaction.commandName === 'chips') {
-            const user = getCasinoUser(interaction.user.id);
+            const u = getCasinoUser(interaction.user.id);
             const embed = new EmbedBuilder()
                 .setTitle('🪙 Jouw chips')
-                .setDescription(
-                    `**Chips:** ${user.chips}\n` +
-                    `**Wins:** ${user.wins}\n` +
-                    `**Losses:** ${user.losses}\n` +
-                    `**Games gespeeld:** ${user.gamesPlayed}`
-                )
+                .setDescription(`**Chips:** ${u.chips}\n**Wins:** ${u.wins}\n**Losses:** ${u.losses}\n**Games:** ${u.gamesPlayed}`)
                 .setColor(CASINO_GOLD)
                 .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 }))
                 .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
-            await interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+            return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
         }
         return;
     }
@@ -1820,363 +1815,162 @@ client.on('interactionCreate', async (interaction) => {
         if (interaction.customId === 'call_modal_public' || interaction.customId === 'call_modal_private') {
             const isPrivate = interaction.customId === 'call_modal_private';
             const name = interaction.fields.getTextInputValue('call_name');
-
             await interaction.deferReply({ flags: MessageFlags.Ephemeral }).catch(() => {});
-
-            let myActiveCalls = 0;
-            for (const [, call] of activeCalls.entries()) {
-                if (call.ownerId === interaction.user.id) myActiveCalls++;
-            }
-            if (myActiveCalls >= CONFIG.MAX_CALLS_PER_USER) {
-                return interaction.editReply({ content: `❌ Je hebt al een actieve call. Je mag max ${CONFIG.MAX_CALLS_PER_USER} call hebben.` });
-            }
-
-            try {
-                await createCall(interaction, name, isPrivate);
-            } catch (err) {
-                console.error('Fout bij maken call:', err);
-                try {
-                    await interaction.editReply({ content: 'Kon de call niet aanmaken.', embeds: [], components: [] });
-                } catch (e) {}
-            }
+            let active = 0;
+            for (const [, c] of activeCalls.entries()) if (c.ownerId === interaction.user.id) active++;
+            if (active >= CONFIG.MAX_CALLS_PER_USER) return interaction.editReply({ content: `❌ Je hebt al een actieve call.` });
+            try { await createCall(interaction, name, isPrivate); } catch (err) { await interaction.editReply({ content: 'Kon call niet maken.' }).catch(() => {}); }
             return;
         }
 
         if (interaction.customId === 'cr_modal_add') {
-            if (!isCustomRoleManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-            const rawName = interaction.fields.getTextInputValue('cr_name').trim();
-            if (!rawName) {
-                return interaction.editReply({ content: '❌ Ongeldige naam.' });
-            }
-            const fontName = toFont(rawName);
-
-            try {
-                const guild = interaction.guild;
-                const newRole = await guild.roles.create({
-                    name: fontName,
-                    color: 0x9b59b6,
-                    reason: `Custom role aangemaakt door ${interaction.user.tag}`
-                });
-                customRoles.push({
-                    name: fontName,
-                    roleId: newRole.id,
-                    order: customRoles.length
-                });
-                await saveToGist();
-                await updateCustomRolePanel();
-                await updateMembersList();
-                await interaction.editReply({ content: `✅ Rol **${fontName}** aangemaakt.` });
-
-                await sendLog(interaction.guild, CONFIG.ROLE_MANAGER_LOG_ID, {
-                    title: '➕ Custom rol toegevoegd',
-                    description: `**Naam:** ${fontName}\n**Rol:** <@&${newRole.id}>\n**Door:** ${interaction.user.tag} (\`${interaction.user.id}\`)`,
-                    color: PURPLE.main,
-                    thumbnail: interaction.user.displayAvatarURL({ dynamic: true, size: 128 })
-                });
-            } catch (err) {
-                console.error('Fout bij maken custom role:', err);
-                await interaction.editReply({ content: `❌ Kon rol niet aanmaken: ${err.message}` });
-            }
-            return;
+            const raw = interaction.fields.getTextInputValue('cr_name').trim();
+            if (!raw) return interaction.editReply({ content: 'Ongeldig.' });
+            const fontName = toFont(raw);
+            const newRole = await interaction.guild.roles.create({ name: fontName, color: 0x9b59b6, reason: `Custom role door ${interaction.user.tag}` });
+            customRoles.push({ name: fontName, roleId: newRole.id, order: customRoles.length });
+            await saveToGist();
+            await updateCustomRolePanel();
+            await updateMembersList();
+            return interaction.editReply({ content: `✅ Rol **${fontName}** aangemaakt.` });
         }
 
         if (interaction.customId.startsWith('cr_modal_rename_')) {
-            if (!isCustomRoleManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const roleId = interaction.customId.replace('cr_modal_rename_', '');
-            const rawName = interaction.fields.getTextInputValue('cr_name').trim();
-            if (!rawName) {
-                return interaction.editReply({ content: '❌ Ongeldige naam.' });
-            }
-            const fontName = toFont(rawName);
+            const raw = interaction.fields.getTextInputValue('cr_name').trim();
             const cr = customRoles.find(c => c.roleId === roleId);
-            if (!cr) {
-                return interaction.editReply({ content: '❌ Rol niet gevonden in de database.' });
-            }
-            try {
-                const guild = interaction.guild;
-                const role = guild.roles.cache.get(roleId);
-                if (role) await role.setName(fontName).catch(() => {});
-                cr.name = fontName;
-                await saveToGist();
-                await updateCustomRolePanel();
-                await updateMembersList();
-                await interaction.editReply({ content: `✅ Rol hernoemd naar **${fontName}**.` });
-
-                await sendLog(interaction.guild, CONFIG.ROLE_MANAGER_LOG_ID, {
-                    title: '✏️ Custom rol hernoemd',
-                    description: `**Nieuwe naam:** ${fontName}\n**Rol:** <@&${roleId}>\n**Door:** ${interaction.user.tag} (\`${interaction.user.id}\`)`,
-                    color: PURPLE.main,
-                    thumbnail: interaction.user.displayAvatarURL({ dynamic: true, size: 128 })
-                });
-            } catch (err) {
-                console.error('Fout bij hernoemen custom role:', err);
-                await interaction.editReply({ content: `❌ Kon rol niet hernoemen: ${err.message}` });
-            }
-            return;
+            if (!cr) return interaction.editReply({ content: 'Rol niet gevonden.' });
+            const fontName = toFont(raw);
+            const role = interaction.guild.roles.cache.get(roleId);
+            if (role) await role.setName(fontName).catch(() => {});
+            cr.name = fontName;
+            await saveToGist();
+            await updateCustomRolePanel();
+            await updateMembersList();
+            return interaction.editReply({ content: `✅ Hernoemd naar **${fontName}**.` });
         }
         return;
     }
 
     if (interaction.isStringSelectMenu()) {
         if (interaction.customId === 'cr_select_remove') {
-            if (!isCustomRoleManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
             const roleId = interaction.values[0];
             const idx = customRoles.findIndex(c => c.roleId === roleId);
-            if (idx === -1) {
-                return interaction.editReply({ content: '❌ Rol niet gevonden.' });
-            }
-            try {
-                const guild = interaction.guild;
-                const role = guild.roles.cache.get(roleId);
-                if (role) await role.delete('Custom role verwijderd').catch(() => {});
-                customRoles.splice(idx, 1);
-                customRoles.forEach((c, i) => c.order = i);
-                await saveToGist();
-                await updateCustomRolePanel();
-                await updateMembersList();
-                await interaction.editReply({ content: '✅ Rol verwijderd.' });
-
-                await sendLog(interaction.guild, CONFIG.ROLE_MANAGER_LOG_ID, {
-                    title: '➖ Custom rol verwijderd',
-                    description: `**Rol ID:** \`${roleId}\`\n**Door:** ${interaction.user.tag} (\`${interaction.user.id}\`)`,
-                    color: PURPLE.dark,
-                    thumbnail: interaction.user.displayAvatarURL({ dynamic: true, size: 128 })
-                });
-            } catch (err) {
-                console.error('Fout bij verwijderen custom role:', err);
-                await interaction.editReply({ content: `❌ Kon rol niet verwijderen: ${err.message}` });
-            }
-            return;
+            if (idx === -1) return interaction.editReply({ content: 'Niet gevonden.' });
+            const role = interaction.guild.roles.cache.get(roleId);
+            if (role) await role.delete().catch(() => {});
+            customRoles.splice(idx, 1);
+            customRoles.forEach((c, i) => c.order = i);
+            await saveToGist();
+            await updateCustomRolePanel();
+            await updateMembersList();
+            return interaction.editReply({ content: '✅ Verwijderd.' });
         }
 
         if (interaction.customId === 'cr_select_rename') {
-            if (!isCustomRoleManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             const roleId = interaction.values[0];
             const cr = customRoles.find(c => c.roleId === roleId);
-            if (!cr) {
-                return interaction.reply({ content: '❌ Rol niet gevonden.', flags: MessageFlags.Ephemeral });
-            }
-            const modal = new ModalBuilder()
-                .setCustomId(`cr_modal_rename_${roleId}`)
-                .setTitle('Custom role hernoemen');
-            const input = new TextInputBuilder()
-                .setCustomId('cr_name')
-                .setLabel('Nieuwe naam (zonder font)')
-                .setStyle(TextInputStyle.Short)
-                .setMaxLength(50)
-                .setRequired(true)
-                .setValue(cr.name);
+            if (!cr) return interaction.reply({ content: 'Niet gevonden.', flags: MessageFlags.Ephemeral });
+            const modal = new ModalBuilder().setCustomId(`cr_modal_rename_${roleId}`).setTitle('Hernoemen');
+            const input = new TextInputBuilder().setCustomId('cr_name').setLabel('Nieuwe naam').setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(true).setValue(cr.name);
             modal.addComponents(new ActionRowBuilder().addComponents(input));
             return interaction.showModal(modal);
         }
 
         if (interaction.customId === 'cr_select_move') {
-            if (!isCustomRoleManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-            const [roleId, direction] = interaction.values[0].split(':');
+            const [roleId, dir] = interaction.values[0].split(':');
             const idx = customRoles.findIndex(c => c.roleId === roleId);
-            if (idx === -1) {
-                return interaction.editReply({ content: '❌ Rol niet gevonden.' });
-            }
-            const target = direction === 'up' ? idx - 1 : idx + 1;
-            if (target < 0 || target >= customRoles.length) {
-                return interaction.editReply({ content: '❌ Kan niet verder verplaatsen.' });
-            }
-            const tmp = customRoles[idx];
-            customRoles[idx] = customRoles[target];
-            customRoles[target] = tmp;
+            if (idx === -1) return interaction.editReply({ content: 'Niet gevonden.' });
+            const target = dir === 'up' ? idx - 1 : idx + 1;
+            if (target < 0 || target >= customRoles.length) return interaction.editReply({ content: 'Kan niet.' });
+            [customRoles[idx], customRoles[target]] = [customRoles[target], customRoles[idx]];
             customRoles.forEach((c, i) => c.order = i);
             await saveToGist();
             await updateCustomRolePanel();
             await updateMembersList();
-            await interaction.editReply({ content: '✅ Volgorde aangepast.' });
-
-            await sendLog(interaction.guild, CONFIG.ROLE_MANAGER_LOG_ID, {
-                title: '🔀 Custom rol volgorde gewijzigd',
-                description: `**Rol:** <@&${roleId}>\n**Richting:** ${direction}\n**Door:** ${interaction.user.tag} (\`${interaction.user.id}\`)`,
-                color: PURPLE.main,
-                thumbnail: interaction.user.displayAvatarURL({ dynamic: true, size: 128 })
-            });
-            return;
+            return interaction.editReply({ content: '✅ Volgorde aangepast.' });
         }
 
         if (interaction.customId.startsWith('gw_reroll_old_')) {
-            if (!isGiveawayManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om te rerollen.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isGiveawayManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             const messageId = interaction.customId.replace('gw_reroll_old_', '');
             const gw = giveaways[messageId];
-            if (!gw) {
-                return interaction.reply({ content: 'Deze giveaway bestaat niet meer.', flags: MessageFlags.Ephemeral });
-            }
+            if (!gw) return interaction.reply({ content: 'Bestaat niet meer.', flags: MessageFlags.Ephemeral });
             const oldWinner = interaction.values[0];
-            if (!gw.winners.includes(oldWinner)) {
-                return interaction.reply({ content: 'Deze gebruiker was geen winnaar.', flags: MessageFlags.Ephemeral });
-            }
-
+            if (!gw.winners.includes(oldWinner)) return interaction.reply({ content: 'Geen winnaar.', flags: MessageFlags.Ephemeral });
             const eligible = gw.participants.filter(id => !gw.winners.includes(id) && id !== oldWinner);
-            if (eligible.length === 0) {
-                return interaction.reply({ content: 'Er zijn geen andere deelnemers om als nieuwe winnaar te kiezen.', flags: MessageFlags.Ephemeral });
-            }
-
-            const options = eligible.slice(0, 25).map(id => ({
-                label: `Deelnemer: ${id}`,
-                value: id
-            }));
-
+            if (eligible.length === 0) return interaction.reply({ content: 'Geen andere deelnemers.', flags: MessageFlags.Ephemeral });
             const select = new StringSelectMenuBuilder()
                 .setCustomId(`gw_reroll_new_${messageId}_${oldWinner}`)
-                .setPlaceholder('Kies de nieuwe winnaar')
-                .addOptions(options);
-
-            return interaction.update({
-                content: `Oude winnaar: <@${oldWinner}>. Kies de nieuwe winnaar:`,
-                components: [new ActionRowBuilder().addComponents(select)]
-            });
+                .setPlaceholder('Nieuwe winnaar')
+                .addOptions(eligible.slice(0, 25).map(id => ({ label: `Deelnemer ${id}`, value: id })));
+            return interaction.update({ content: `Oude winnaar: <@${oldWinner}>. Kies nieuwe:`, components: [new ActionRowBuilder().addComponents(select)] });
         }
 
         if (interaction.customId.startsWith('gw_reroll_new_')) {
-            if (!isGiveawayManager(interaction)) {
-                return interaction.reply({ content: 'Je hebt geen toestemming om te rerollen.', flags: MessageFlags.Ephemeral });
-            }
+            if (!isGiveawayManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             const rest = interaction.customId.replace('gw_reroll_new_', '');
             const parts = rest.split('_');
             const oldWinner = parts.pop();
             const messageId = parts.join('_');
-
             const gw = giveaways[messageId];
-            if (!gw) {
-                return interaction.reply({ content: 'Deze giveaway bestaat niet meer.', flags: MessageFlags.Ephemeral });
-            }
-
+            if (!gw) return interaction.reply({ content: 'Bestaat niet meer.', flags: MessageFlags.Ephemeral });
             const newWinner = interaction.values[0];
-            if (!gw.participants.includes(newWinner)) {
-                return interaction.reply({ content: 'Deze gebruiker deed niet mee aan de giveaway.', flags: MessageFlags.Ephemeral });
-            }
-
-            const winnerIdx = gw.winners.indexOf(oldWinner);
-            if (winnerIdx === -1) {
-                return interaction.reply({ content: 'De oude winnaar is niet meer geldig.', flags: MessageFlags.Ephemeral });
-            }
-            gw.winners[winnerIdx] = newWinner;
+            if (!gw.participants.includes(newWinner)) return interaction.reply({ content: 'Deed niet mee.', flags: MessageFlags.Ephemeral });
+            const idx = gw.winners.indexOf(oldWinner);
+            if (idx === -1) return interaction.reply({ content: 'Ongeldig.', flags: MessageFlags.Ephemeral });
+            gw.winners[idx] = newWinner;
             await saveToGist();
-
             try {
                 const channel = await client.channels.fetch(gw.channelId);
                 const msg = await channel.messages.fetch(messageId);
                 await msg.edit({ embeds: [buildGiveawayEmbed(gw)], components: buildGiveawayRows(messageId, true) });
-                await channel.send(`🔁 Nieuwe winnaar: <@${newWinner}>! Je hebt **${gw.prize}** gewonnen (oude winnaar <@${oldWinner}> had niet geclaimd).`);
+                await channel.send(`🔁 Nieuwe winnaar: <@${newWinner}>!`);
             } catch (err) {}
-
-            await sendLog(interaction.guild, CONFIG.GIVEAWAY_LOG_ID, {
-                title: '🔁 Giveaway reroll',
-                description:
-                    `**Prijs:** ${gw.prize}\n` +
-                    `**Oude winnaar:** <@${oldWinner}>\n` +
-                    `**Nieuwe winnaar:** <@${newWinner}>\n` +
-                    `**Door:** ${interaction.user.tag} (\`${interaction.user.id}\`)`,
-                color: PURPLE.main,
-                thumbnail: interaction.user.displayAvatarURL({ dynamic: true, size: 128 })
-            });
-
-            return interaction.update({ content: `✅ Nieuwe winnaar ingesteld: <@${newWinner}>.`, components: [] });
+            return interaction.update({ content: `✅ Nieuwe winnaar: <@${newWinner}>.`, components: [] });
         }
 
         if (interaction.customId.startsWith('call_allow_select_')) {
             const channelId = interaction.customId.replace('call_allow_select_', '');
             const call = activeCalls.get(channelId);
-            if (!call) {
-                return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
-            }
-            if (interaction.user.id !== call.ownerId) {
-                return interaction.reply({ content: 'Alleen de eigenaar kan mensen toelaten.', flags: MessageFlags.Ephemeral });
-            }
-
+            if (!call || interaction.user.id !== call.ownerId) return interaction.reply({ content: 'Niet toegestaan.', flags: MessageFlags.Ephemeral });
             const userId = interaction.values[0];
             try {
                 const channel = await client.channels.fetch(channelId);
                 await channel.permissionOverwrites.edit(userId, { ViewChannel: true, Connect: true });
                 if (!callAllowed.has(channelId)) callAllowed.set(channelId, new Set());
                 callAllowed.get(channelId).add(userId);
-
                 await updateCallControlMessage(channelId, call.ownerId, call.isPrivate);
-
-                await interaction.reply({ content: `<@${userId}> is toegelaten tot de call.`, flags: MessageFlags.Ephemeral });
-
-                try {
-                    const payload = buildCallInfoMessage(channelId, call.ownerId, call.isPrivate);
-                    await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
-                } catch (e) {}
-
-                await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
-                    title: '✅ Toegelaten tot call',
-                    description: `**Eigenaar:** <@${call.ownerId}>\n**Toegelaten:** <@${userId}>\n**Call:** <#${channelId}>`,
-                    color: PURPLE.main
-                });
-            } catch (err) {
-                console.error('Fout bij toelaten user:', err);
-                await interaction.reply({ content: 'Kon de gebruiker niet toelaten.', flags: MessageFlags.Ephemeral }).catch(() => {});
-            }
+                await interaction.reply({ content: `<@${userId}> toegelaten.`, flags: MessageFlags.Ephemeral });
+            } catch (err) { await interaction.reply({ content: 'Mislukt.', flags: MessageFlags.Ephemeral }); }
             return;
         }
 
         if (interaction.customId.startsWith('call_remove_select_')) {
             const channelId = interaction.customId.replace('call_remove_select_', '');
             const call = activeCalls.get(channelId);
-            if (!call) {
-                return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
-            }
-            if (interaction.user.id !== call.ownerId) {
-                return interaction.reply({ content: 'Alleen de eigenaar kan mensen verwijderen.', flags: MessageFlags.Ephemeral });
-            }
-
+            if (!call || interaction.user.id !== call.ownerId) return interaction.reply({ content: 'Niet toegestaan.', flags: MessageFlags.Ephemeral });
             const userId = interaction.values[0];
-            if (userId === call.ownerId) {
-                return interaction.reply({ content: 'Je kan jezelf niet verwijderen.', flags: MessageFlags.Ephemeral });
-            }
-
+            if (userId === call.ownerId) return interaction.reply({ content: 'Kan jezelf niet verwijderen.', flags: MessageFlags.Ephemeral });
             try {
                 const channel = await client.channels.fetch(channelId);
                 await channel.permissionOverwrites.delete(userId).catch(() => {});
                 const allowed = callAllowed.get(channelId);
                 if (allowed) allowed.delete(userId);
-
-                const voiceMember = channel.members.get(userId);
-                if (voiceMember) {
-                    await voiceMember.voice.disconnect('Verwijderd uit call door eigenaar').catch(() => {});
-                }
-
+                const vm = channel.members.get(userId);
+                if (vm) await vm.voice.disconnect('Verwijderd door eigenaar').catch(() => {});
                 await updateCallControlMessage(channelId, call.ownerId, call.isPrivate);
-
-                await interaction.reply({ content: `<@${userId}> is verwijderd uit de call.`, flags: MessageFlags.Ephemeral });
-
-                try {
-                    const payload = buildCallInfoMessage(channelId, call.ownerId, call.isPrivate);
-                    await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
-                } catch (e) {}
-
-                await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
-                    title: '➖ Verwijderd uit call',
-                    description: `**Eigenaar:** <@${call.ownerId}>\n**Verwijderd:** <@${userId}>\n**Call:** <#${channelId}>`,
-                    color: PURPLE.dark
-                });
-            } catch (err) {
-                console.error('Fout bij verwijderen user uit call:', err);
-                await interaction.reply({ content: 'Kon de gebruiker niet verwijderen.', flags: MessageFlags.Ephemeral }).catch(() => {});
-            }
+                await interaction.reply({ content: `<@${userId}> verwijderd.`, flags: MessageFlags.Ephemeral });
+            } catch (err) { await interaction.reply({ content: 'Mislukt.', flags: MessageFlags.Ephemeral }); }
             return;
         }
         return;
@@ -2184,276 +1978,140 @@ client.on('interactionCreate', async (interaction) => {
 
     if (!interaction.isButton()) return;
 
+    if (interaction.customId === 'casino_reset') {
+        const u = getCasinoUser(interaction.user.id);
+        if (u.chips > 0) return interaction.reply({ content: 'Je hebt nog chips.', flags: MessageFlags.Ephemeral });
+        resetCasinoUser(interaction.user.id);
+        await saveToGist();
+        return interaction.update({ content: '✅ Je chips zijn gereset naar **100**.', components: [] });
+    }
+
+    if (interaction.customId.startsWith('crash_cashout_')) {
+        return handleCrashCashout(interaction, interaction.customId.replace('crash_cashout_', ''));
+    }
+
     if (interaction.customId.startsWith('gw_join_') || (interaction.customId.startsWith('gw_reroll_') && !interaction.customId.startsWith('gw_reroll_old_') && !interaction.customId.startsWith('gw_reroll_new_'))) {
         return handleGiveawayButton(interaction);
     }
 
     if (interaction.customId === 'cr_add') {
-        if (!isCustomRoleManager(interaction)) {
-            return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-        }
-        const modal = new ModalBuilder()
-            .setCustomId('cr_modal_add')
-            .setTitle('Custom role toevoegen');
-        const input = new TextInputBuilder()
-            .setCustomId('cr_name')
-            .setLabel('Naam (zonder font)')
-            .setStyle(TextInputStyle.Short)
-            .setMaxLength(50)
-            .setRequired(true)
-            .setPlaceholder('bijv. Familie Snus Dictator');
+        if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
+        const modal = new ModalBuilder().setCustomId('cr_modal_add').setTitle('Rol toevoegen');
+        const input = new TextInputBuilder().setCustomId('cr_name').setLabel('Naam (zonder font)').setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(true);
         modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
     }
 
     if (interaction.customId === 'cr_remove') {
-        if (!isCustomRoleManager(interaction)) {
-            return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-        }
-        if (customRoles.length === 0) {
-            return interaction.reply({ content: 'Er zijn geen custom rollen om te verwijderen.', flags: MessageFlags.Ephemeral });
-        }
-        const select = new StringSelectMenuBuilder()
-            .setCustomId('cr_select_remove')
-            .setPlaceholder('Kies een rol om te verwijderen')
-            .addOptions(customRoles.map(c => ({ label: c.name, value: c.roleId })));
-        return interaction.reply({
-            content: 'Kies een rol om te verwijderen:',
-            components: [new ActionRowBuilder().addComponents(select)],
-            flags: MessageFlags.Ephemeral
-        });
+        if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
+        if (customRoles.length === 0) return interaction.reply({ content: 'Geen rollen.', flags: MessageFlags.Ephemeral });
+        const select = new StringSelectMenuBuilder().setCustomId('cr_select_remove').setPlaceholder('Kies').addOptions(customRoles.map(c => ({ label: c.name, value: c.roleId })));
+        return interaction.reply({ content: 'Kies:', components: [new ActionRowBuilder().addComponents(select)], flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId === 'cr_rename') {
-        if (!isCustomRoleManager(interaction)) {
-            return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-        }
-        if (customRoles.length === 0) {
-            return interaction.reply({ content: 'Er zijn geen custom rollen om te hernoemen.', flags: MessageFlags.Ephemeral });
-        }
-        const select = new StringSelectMenuBuilder()
-            .setCustomId('cr_select_rename')
-            .setPlaceholder('Kies een rol om te hernoemen')
-            .addOptions(customRoles.map(c => ({ label: c.name, value: c.roleId })));
-        return interaction.reply({
-            content: 'Kies een rol om te hernoemen:',
-            components: [new ActionRowBuilder().addComponents(select)],
-            flags: MessageFlags.Ephemeral
-        });
+        if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
+        if (customRoles.length === 0) return interaction.reply({ content: 'Geen rollen.', flags: MessageFlags.Ephemeral });
+        const select = new StringSelectMenuBuilder().setCustomId('cr_select_rename').setPlaceholder('Kies').addOptions(customRoles.map(c => ({ label: c.name, value: c.roleId })));
+        return interaction.reply({ content: 'Kies:', components: [new ActionRowBuilder().addComponents(select)], flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId === 'cr_up' || interaction.customId === 'cr_down') {
-        if (!isCustomRoleManager(interaction)) {
-            return interaction.reply({ content: 'Je hebt geen toestemming.', flags: MessageFlags.Ephemeral });
-        }
-        if (customRoles.length < 2) {
-            return interaction.reply({ content: 'Er moeten minstens 2 rollen zijn om van volgorde te wisselen.', flags: MessageFlags.Ephemeral });
-        }
-        const direction = interaction.customId === 'cr_up' ? 'up' : 'down';
-        const options = [];
+        if (!isCustomRoleManager(interaction)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
+        if (customRoles.length < 2) return interaction.reply({ content: 'Min 2 rollen.', flags: MessageFlags.Ephemeral });
+        const dir = interaction.customId === 'cr_up' ? 'up' : 'down';
+        const opts = [];
         for (let i = 0; i < customRoles.length; i++) {
-            const c = customRoles[i];
-            if (direction === 'up' && i === 0) continue;
-            if (direction === 'down' && i === customRoles.length - 1) continue;
-            options.push({ label: c.name, value: `${c.roleId}:${direction}` });
+            if (dir === 'up' && i === 0) continue;
+            if (dir === 'down' && i === customRoles.length - 1) continue;
+            opts.push({ label: customRoles[i].name, value: `${customRoles[i].roleId}:${dir}` });
         }
-        if (options.length === 0) {
-            return interaction.reply({ content: 'Geen rollen om te verplaatsen.', flags: MessageFlags.Ephemeral });
-        }
-        const select = new StringSelectMenuBuilder()
-            .setCustomId('cr_select_move')
-            .setPlaceholder(`Kies een rol om ${direction === 'up' ? 'omhoog' : 'omlaag'} te verplaatsen`)
-            .addOptions(options);
-        return interaction.reply({
-            content: `Kies een rol om ${direction === 'up' ? 'omhoog' : 'omlaag'} te verplaatsen:`,
-            components: [new ActionRowBuilder().addComponents(select)],
-            flags: MessageFlags.Ephemeral
-        });
+        if (opts.length === 0) return interaction.reply({ content: 'Niks te verplaatsen.', flags: MessageFlags.Ephemeral });
+        const select = new StringSelectMenuBuilder().setCustomId('cr_select_move').setPlaceholder('Kies').addOptions(opts);
+        return interaction.reply({ content: 'Kies:', components: [new ActionRowBuilder().addComponents(select)], flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId === 'call_open_public' || interaction.customId === 'call_open_private') {
         const isPrivate = interaction.customId === 'call_open_private';
-        const modal = new ModalBuilder()
-            .setCustomId(isPrivate ? 'call_modal_private' : 'call_modal_public')
-            .setTitle(isPrivate ? 'Privé call maken' : 'Openbare call maken');
-        const input = new TextInputBuilder()
-            .setCustomId('call_name')
-            .setLabel('Naam van de call')
-            .setStyle(TextInputStyle.Short)
-            .setMaxLength(50)
-            .setMinLength(1)
-            .setRequired(true)
-            .setPlaceholder('bijv. chillen');
+        const modal = new ModalBuilder().setCustomId(isPrivate ? 'call_modal_private' : 'call_modal_public').setTitle(isPrivate ? 'Privé call' : 'Openbare call');
+        const input = new TextInputBuilder().setCustomId('call_name').setLabel('Naam').setStyle(TextInputStyle.Short).setMaxLength(50).setRequired(true);
         modal.addComponents(new ActionRowBuilder().addComponents(input));
         return interaction.showModal(modal);
     }
 
     if (interaction.customId === 'call_office_panel') {
-        const myCalls = [];
-        for (const [channelId, call] of activeCalls.entries()) {
-            if (call.ownerId === interaction.user.id) {
-                myCalls.push({ channelId, ...call });
-            }
-        }
-
-        if (myCalls.length === 0) {
-            return interaction.reply({
-                content: 'Je hebt momenteel geen actieve call. Maak eerst een call aan met **Openbaar** of **Privé**.',
-                flags: MessageFlags.Ephemeral
-            });
-        }
-
-        for (let i = 0; i < myCalls.length; i++) {
-            const c = myCalls[i];
-            const payload = buildCallInfoMessage(c.channelId, c.ownerId, c.isPrivate);
-            if (i === 0) {
-                await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
-            } else {
-                await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
-            }
+        const mine = [];
+        for (const [cid, call] of activeCalls.entries()) if (call.ownerId === interaction.user.id) mine.push({ cid, ...call });
+        if (mine.length === 0) return interaction.reply({ content: 'Geen actieve call.', flags: MessageFlags.Ephemeral });
+        for (let i = 0; i < mine.length; i++) {
+            const c = mine[i];
+            const payload = buildCallInfoMessage(c.cid, c.ownerId, c.isPrivate);
+            if (i === 0) await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral });
+            else await interaction.followUp({ ...payload, flags: MessageFlags.Ephemeral });
         }
         return;
     }
 
     if (interaction.customId.startsWith('call_allow_') && !interaction.customId.startsWith('call_allow_select_')) {
-        const channelId = interaction.customId.replace('call_allow_', '');
-        const call = activeCalls.get(channelId);
-        if (!call) {
-            return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
-        }
-        if (interaction.user.id !== call.ownerId) {
-            return interaction.reply({ content: 'Alleen de eigenaar kan mensen toelaten.', flags: MessageFlags.Ephemeral });
-        }
-
-        const selectRow = new ActionRowBuilder().addComponents(
-            new UserSelectMenuBuilder()
-                .setCustomId(`call_allow_select_${channelId}`)
-                .setPlaceholder('Kies een lid om toe te laten')
-                .setMinValues(1)
-                .setMaxValues(1)
-        );
-        return interaction.reply({ content: 'Kies een lid om toe te laten:', components: [selectRow], flags: MessageFlags.Ephemeral });
+        const cid = interaction.customId.replace('call_allow_', '');
+        const call = activeCalls.get(cid);
+        if (!call || interaction.user.id !== call.ownerId) return interaction.reply({ content: 'Niet toegestaan.', flags: MessageFlags.Ephemeral });
+        const row = new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId(`call_allow_select_${cid}`).setPlaceholder('Kies').setMinValues(1).setMaxValues(1));
+        return interaction.reply({ content: 'Kies:', components: [row], flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId.startsWith('call_remove_') && !interaction.customId.startsWith('call_remove_select_')) {
-        const channelId = interaction.customId.replace('call_remove_', '');
-        const call = activeCalls.get(channelId);
-        if (!call) {
-            return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
-        }
-        if (interaction.user.id !== call.ownerId) {
-            return interaction.reply({ content: 'Alleen de eigenaar kan mensen verwijderen.', flags: MessageFlags.Ephemeral });
-        }
-
-        const selectRow = new ActionRowBuilder().addComponents(
-            new UserSelectMenuBuilder()
-                .setCustomId(`call_remove_select_${channelId}`)
-                .setPlaceholder('Kies een lid om te verwijderen')
-                .setMinValues(1)
-                .setMaxValues(1)
-        );
-        return interaction.reply({ content: 'Kies een lid om te verwijderen:', components: [selectRow], flags: MessageFlags.Ephemeral });
+        const cid = interaction.customId.replace('call_remove_', '');
+        const call = activeCalls.get(cid);
+        if (!call || interaction.user.id !== call.ownerId) return interaction.reply({ content: 'Niet toegestaan.', flags: MessageFlags.Ephemeral });
+        const row = new ActionRowBuilder().addComponents(new UserSelectMenuBuilder().setCustomId(`call_remove_select_${cid}`).setPlaceholder('Kies').setMinValues(1).setMaxValues(1));
+        return interaction.reply({ content: 'Kies:', components: [row], flags: MessageFlags.Ephemeral });
     }
 
     if (interaction.customId.startsWith('call_hide_')) {
-        try {
-            await interaction.update({ content: '🙈 Bericht verborgen. Je kan de knoppen in het call-kanaal gebruiken, of via **Kantoor** opnieuw openen.', embeds: [], components: [] });
-        } catch (err) {}
+        try { await interaction.update({ content: '🙈 Verborgen.', embeds: [], components: [] }); } catch (e) {}
         return;
     }
 
     if (interaction.customId.startsWith('call_delete_')) {
-        const channelId = interaction.customId.replace('call_delete_', '');
-        const call = activeCalls.get(channelId);
-        if (!call) {
-            return interaction.reply({ content: 'Deze call bestaat niet meer.', flags: MessageFlags.Ephemeral });
-        }
-        if (interaction.user.id !== call.ownerId) {
-            return interaction.reply({ content: 'Alleen de eigenaar kan de call verwijderen.', flags: MessageFlags.Ephemeral });
-        }
-
-        try {
-            const channel = await client.channels.fetch(channelId).catch(() => null);
-            if (channel) await channel.delete('Eigenaar heeft de call verwijderd').catch(() => {});
-        } catch (err) {
-            console.error('Fout bij verwijderen call:', err);
-        }
-        activeCalls.delete(channelId);
-        callAllowed.delete(channelId);
-        callInfoMessages.delete(channelId);
-
-        try {
-            await interaction.update({ content: '🗑️ Call verwijderd.', embeds: [], components: [] });
-        } catch (err) {}
-
-        await sendLog(interaction.guild, CONFIG.CALL_LOG_ID, {
-            title: '🗑️ Call verwijderd',
-            description: `**Eigenaar:** <@${call.ownerId}>\n**Kanaal:** <#${channelId}>`,
-            color: PURPLE.dark
-        });
+        const cid = interaction.customId.replace('call_delete_', '');
+        const call = activeCalls.get(cid);
+        if (!call || interaction.user.id !== call.ownerId) return interaction.reply({ content: 'Niet toegestaan.', flags: MessageFlags.Ephemeral });
+        const channel = await client.channels.fetch(cid).catch(() => null);
+        if (channel) await channel.delete().catch(() => {});
+        activeCalls.delete(cid); callAllowed.delete(cid); callInfoMessages.delete(cid);
+        try { await interaction.update({ content: '🗑️ Call verwijderd.', embeds: [], components: [] }); } catch (e) {}
         return;
     }
 
     if (interaction.customId === CONFIG.VERIFY_BUTTON_ID) {
         try {
             const role = interaction.guild.roles.cache.get(CONFIG.VERIFY_ROLE_ID);
-            if (!role) {
-                return interaction.reply({ content: 'De verify rol is niet gevonden.', flags: MessageFlags.Ephemeral });
-            }
-            if (interaction.member.roles.cache.has(CONFIG.VERIFY_ROLE_ID)) {
-                return interaction.reply({ content: 'Je bent al geverifieerd!', flags: MessageFlags.Ephemeral });
-            }
+            if (!role) return interaction.reply({ content: 'Rol niet gevonden.', flags: MessageFlags.Ephemeral });
+            if (interaction.member.roles.cache.has(CONFIG.VERIFY_ROLE_ID)) return interaction.reply({ content: 'Al geverifieerd.', flags: MessageFlags.Ephemeral });
             await interaction.member.roles.add(role);
-            const newCount = await countRoleMembers(interaction.guild, CONFIG.VERIFY_ROLE_ID, true);
-            const newRow = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(CONFIG.VERIFY_BUTTON_ID)
-                    .setLabel(`${newCount}`)
-                    .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success)
-            );
+            const count = await countRoleMembers(interaction.guild, CONFIG.VERIFY_ROLE_ID, true);
+            const newRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(CONFIG.VERIFY_BUTTON_ID).setLabel(`${count}`).setEmoji('✅').setStyle(ButtonStyle.Success));
             await interaction.message.edit({ components: [newRow] }).catch(() => {});
-            await interaction.reply({ content: 'Je bent geverifieerd! Welkom bij Familie Snus.', flags: MessageFlags.Ephemeral });
-        } catch (err) {
-            console.error('Fout bij verify:', err);
-            if (!interaction.replied) {
-                await interaction.reply({ content: 'Er ging iets mis.', flags: MessageFlags.Ephemeral }).catch(() => {});
-            }
-        }
+            return interaction.reply({ content: 'Geverifieerd! Welkom.', flags: MessageFlags.Ephemeral });
+        } catch (err) { if (!interaction.replied) await interaction.reply({ content: 'Fout.', flags: MessageFlags.Ephemeral }).catch(() => {}); }
         return;
     }
 
     if (interaction.customId === CONFIG.SNAP_BUTTON_ID) {
         try {
             const role = interaction.guild.roles.cache.get(CONFIG.SNAP_ROLE_ID);
-            if (!role) {
-                return interaction.reply({ content: 'De Snapchat Ping rol is niet gevonden.', flags: MessageFlags.Ephemeral });
-            }
-            if (interaction.member.roles.cache.has(CONFIG.SNAP_ROLE_ID)) {
-                return interaction.reply({ content: 'Je hebt de Snapchat Ping rol al!', flags: MessageFlags.Ephemeral });
-            }
+            if (!role) return interaction.reply({ content: 'Rol niet gevonden.', flags: MessageFlags.Ephemeral });
+            if (interaction.member.roles.cache.has(CONFIG.SNAP_ROLE_ID)) return interaction.reply({ content: 'Al gekoppeld.', flags: MessageFlags.Ephemeral });
             await interaction.member.roles.add(role);
-            const newCount = await countRoleMembers(interaction.guild, CONFIG.SNAP_ROLE_ID, true);
-            const newRow = new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(CONFIG.SNAP_BUTTON_ID)
-                    .setLabel(`${newCount}`)
-                    .setEmoji('👻')
-                    .setStyle(ButtonStyle.Primary)
-            );
+            const count = await countRoleMembers(interaction.guild, CONFIG.SNAP_ROLE_ID, true);
+            const newRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(CONFIG.SNAP_BUTTON_ID).setLabel(`${count}`).setEmoji('👻').setStyle(ButtonStyle.Primary));
             await interaction.message.edit({ components: [newRow] }).catch(() => {});
-            await interaction.reply({ content: 'Je hebt de Snapchat Ping rol gekregen.', flags: MessageFlags.Ephemeral });
-        } catch (err) {
-            console.error('Fout bij snapchat:', err);
-            if (!interaction.replied) {
-                await interaction.reply({ content: 'Er ging iets mis.', flags: MessageFlags.Ephemeral }).catch(() => {});
-            }
-        }
+            return interaction.reply({ content: 'Snapchat Ping rol gekregen.', flags: MessageFlags.Ephemeral });
+        } catch (err) { if (!interaction.replied) await interaction.reply({ content: 'Fout.', flags: MessageFlags.Ephemeral }).catch(() => {}); }
     }
 });
 
-client.on('error', (err) => {
-    console.error('Client error:', err);
-});
+client.on('error', (err) => console.error('Client error:', err));
 
 client.login(CONFIG.TOKEN);
