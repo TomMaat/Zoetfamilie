@@ -94,7 +94,10 @@ const CONFIG = {
     CRASHER_STEP: 0.01,
     CRASHER_EDIT_EVERY_N_TICKS: 5,
 
-    COUNTING_RESET_WAIT_MS: 4000
+    COUNTING_RESET_WAIT_MS: 4000,
+
+    SAVE_MIN_INTERVAL_MS: 5000,
+    SAVE_DEBOUNCE_MS: 1500
 };
 
 let customRoles = [];
@@ -184,8 +187,33 @@ async function loadFromGist() {
     console.log(`Database geladen: kicks=${kickData.total}, antinuke=${antinukeData.enabled}, customRoles=${customRoles.length}, giveaways=${Object.keys(giveaways).length}, casino=${Object.keys(casino).length}`);
 }
 
-async function saveToGist() {
+// --- GIST SAVE MET DEBOUNCE ---
+let saveDebounceTimer = null;
+let savePending = false;
+let saveInFlight = false;
+let lastSaveAt = 0;
+
+function scheduleSaveToGist(delayMs = CONFIG.SAVE_DEBOUNCE_MS) {
+    savePending = true;
+    if (saveDebounceTimer) clearTimeout(saveDebounceTimer);
+    saveDebounceTimer = setTimeout(() => { flushSaveToGist(); }, delayMs);
+}
+
+async function flushSaveToGist() {
     if (!gistReady || !gistId) return;
+    if (!savePending) return;
+    if (saveInFlight) return;
+
+    const sinceLast = Date.now() - lastSaveAt;
+    if (sinceLast < CONFIG.SAVE_MIN_INTERVAL_MS) {
+        scheduleSaveToGist(CONFIG.SAVE_MIN_INTERVAL_MS - sinceLast);
+        return;
+    }
+
+    saveInFlight = true;
+    savePending = false;
+    lastSaveAt = Date.now();
+
     try {
         await gistRequest('PATCH', `/gists/${gistId}`, {
             files: { [GIST_FILE]: { content: JSON.stringify({
@@ -193,7 +221,23 @@ async function saveToGist() {
                 backups, giveaways, countingState, casino
             }, null, 2) } }
         });
-    } catch (err) { console.error('Fout bij opslaan database:', err.message); }
+    } catch (err) {
+        savePending = true;
+        const isRateLimit = err.message && (err.message.includes('403') || err.message.includes('rate limit'));
+        if (isRateLimit) {
+            console.warn('GitHub rate limit — retry over 60s');
+            scheduleSaveToGist(60000);
+        } else {
+            console.error('Fout bij opslaan database:', err.message);
+            scheduleSaveToGist(10000);
+        }
+    } finally {
+        saveInFlight = false;
+    }
+}
+
+async function saveToGist() {
+    scheduleSaveToGist();
 }
 
 const FONT_MAP = {
@@ -519,7 +563,6 @@ async function handleCountingMessage(message) {
     const state = countingState[message.channel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
     const match = message.content.trim().match(/^(\d+)$/);
 
-    // Reset: eerst foutmelding tonen, wachten, dan pas wissen + nieuwe embed
     const reset = async (errorText) => {
         try {
             const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID);
@@ -548,7 +591,6 @@ async function handleCountingMessage(message) {
         return reset(`❌ ${message.author} - Fout! Je moest **${state.current + 1}** typen. Het spel begint opnieuw bij **1**.`);
     }
 
-    // Geldige zet: ✅ reactie, stand ophogen, embed update
     state.current = typed;
     state.lastUserId = message.author.id;
     if (state.current > (state.highScore || 0)) state.highScore = state.current;
