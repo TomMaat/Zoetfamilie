@@ -102,7 +102,9 @@ const CONFIG = {
         kickAdd: 3,
         memberRoleUpdate: 10
     },
-    ANTINUKE_WINDOW_MS: 10000
+    ANTINUKE_WINDOW_MS: 10000,
+
+    CHIP_GIVER_ID: '1033753872927293520'
 };
 
 const FIXED_RANKS = [
@@ -128,6 +130,7 @@ let giveaways = {};
 let countingState = {};
 let casino = {};
 let crashGames = new Map();
+let blackjackGames = new Map();
 let casinoPanelMessageId = null;
 let casinoLeaderboardMessageId = null;
 
@@ -365,7 +368,11 @@ async function clearChannel(channel) {
         do {
             fetched = await channel.messages.fetch({ limit: 100 });
             if (fetched.size === 0) break;
-            for (const msg of fetched.values()) await msg.delete().catch(() => {});
+            const recent = fetched.filter(m => Date.now() - m.createdTimestamp < 14 * 24 * 60 * 60 * 1000);
+            const old = fetched.filter(m => Date.now() - m.createdTimestamp >= 14 * 24 * 60 * 60 * 1000);
+            if (recent.size > 1) await channel.bulkDelete(recent, true).catch(() => {});
+            else if (recent.size === 1) await recent.first().delete().catch(() => {});
+            for (const m of old.values()) await m.delete().catch(() => {});
         } while (fetched.size > 0);
     } catch (err) {}
 }
@@ -583,26 +590,51 @@ function buildCountingEmbed(state) {
         .setColor(PURPLE.main).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 }
 
+async function resetCountingChannel(state) {
+    try {
+        const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID).catch(() => null);
+        if (!channel) return null;
+
+        let fetched;
+        do {
+            fetched = await channel.messages.fetch({ limit: 100 }).catch(() => null);
+            if (!fetched || fetched.size === 0) break;
+            const recent = fetched.filter(m => Date.now() - m.createdTimestamp < 14 * 24 * 60 * 60 * 1000);
+            const old = fetched.filter(m => Date.now() - m.createdTimestamp >= 14 * 24 * 60 * 60 * 1000);
+            if (recent.size > 1) await channel.bulkDelete(recent, true).catch(() => {});
+            else if (recent.size === 1) await recent.first().delete().catch(() => {});
+            for (const m of old.values()) await m.delete().catch(() => {});
+        } while (fetched && fetched.size > 0);
+
+        const sent = await channel.send({ embeds: [buildCountingEmbed(state)] });
+        state.lastMessageId = sent.id;
+        countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
+        await saveToGist();
+        return sent.id;
+    } catch (err) {
+        console.error('Fout bij reset counting channel:', err.message);
+        return null;
+    }
+}
+
 async function updateCountingEmbed(state) {
     try {
         const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID).catch(() => null);
         if (!channel) return;
-        const payload = buildCountingEmbed(state);
         if (state.lastMessageId) {
             try {
                 const msg = await channel.messages.fetch(state.lastMessageId);
-                await msg.edit(payload);
+                await msg.edit({ embeds: [buildCountingEmbed(state)] });
                 return;
             } catch (e) { state.lastMessageId = null; }
         }
-        try {
-            const fetched = await channel.messages.fetch({ limit: 20 });
-            for (const m of fetched.filter(m => m.author.id === client.user.id).values()) await m.delete().catch(() => {});
-        } catch (e) {}
-        const sent = await channel.send(payload);
+        const sent = await channel.send({ embeds: [buildCountingEmbed(state)] });
         state.lastMessageId = sent.id;
         countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
-    } catch (err) {}
+        await saveToGist();
+    } catch (err) {
+        console.error('Fout bij update counting embed:', err.message);
+    }
 }
 
 async function handleCountingMessage(message) {
@@ -613,20 +645,33 @@ async function handleCountingMessage(message) {
     const match = message.content.trim().match(/^(\d+)$/);
 
     const reset = async (msg) => {
-        await message.delete().catch(() => {});
         state.current = 0;
         state.lastUserId = null;
         countingState[message.channel.id] = state;
         await saveToGist();
-        await updateCountingEmbed(state);
-        await message.channel.send({ content: msg }).catch(() => {});
+        const newId = await resetCountingChannel(state);
+        if (newId) {
+            try {
+                const channel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID);
+                await channel.send({ content: msg }).catch(() => {});
+            } catch (e) {}
+        }
     };
 
-    if (!match) return reset(`${message.author} - Geen geldig getal. Opnieuw bij **1**.`);
+    if (!match) {
+        await message.delete().catch(() => {});
+        return reset(`${message.author} - Geen geldig getal. Opnieuw bij **1**.`);
+    }
+
     const typed = parseInt(match[1], 10);
-    if (state.lastUserId === message.author.id) return reset(`${message.author} - Niet 2x achter elkaar. Opnieuw bij **1**.`);
+
+    if (state.lastUserId === message.author.id) {
+        await message.delete().catch(() => {});
+        return reset(`${message.author} - Niet 2x achter elkaar. Opnieuw bij **1**.`);
+    }
+
     if (typed !== state.current + 1) {
-        await message.react('❌').catch(() => {});
+        await message.delete().catch(() => {});
         return reset(`${message.author} - Fout! Je moest **${state.current + 1}** typen. Opnieuw bij **1**.`);
     }
 
@@ -635,7 +680,7 @@ async function handleCountingMessage(message) {
     if (state.current > (state.highScore || 0)) state.highScore = state.current;
     countingState[message.channel.id] = state;
     await saveToGist();
-    await message.react('✅').catch(() => {});
+    await message.delete().catch(() => {});
     await updateCountingEmbed(state);
 }
 
@@ -668,7 +713,7 @@ function buildCasinoLeaderboardEmbed() {
     else {
         const medals = ['🥇', '🥈', '🥉'];
         entries.forEach((e, i) => {
-            body += `${medals[i] || `**${i + 1}.**`} <@${e.id}> — **${e.chips} chips** (${e.wins}W / ${e.losses}L)\n`;
+            body += `${medals[i] || `**${i + 1}.**`} <@${e.id}> — **${e.chips} chips**\n`;
         });
     }
     return new EmbedBuilder().setTitle('🏆 Casino Leaderboard — Top 10').setDescription(`**Rijkste spelers:**\n\n${body}`).setColor(CASINO_GOLD).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
@@ -716,6 +761,94 @@ async function updateCasinoPanel() {
     } catch (err) {}
 }
 
+// --- BLACKJACK ---
+const BJ_SUITS = ['♠️', '♥️', '♦️', '♣️'];
+const BJ_RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+const bjDraw = () => ({ suit: BJ_SUITS[Math.floor(Math.random() * 4)], rank: BJ_RANKS[Math.floor(Math.random() * 13)] });
+const bjVal = (c) => c.rank === 'A' ? 11 : ['J', 'Q', 'K'].includes(c.rank) ? 10 : parseInt(c.rank, 10);
+const bjTotal = (h) => { let t = 0, a = 0; for (const c of h) { t += bjVal(c); if (c.rank === 'A') a++; } while (t > 21 && a > 0) { t -= 10; a--; } return t; };
+const bjFmt = (h) => h.map(c => `${c.rank}${c.suit}`).join(' ');
+
+function bjBuildEmbed(game, status, color, revealDealer = false) {
+    const pt = bjTotal(game.player);
+    const dealerLine = revealDealer
+        ? `**Dealer:** ${bjFmt(game.dealer)} (**${bjTotal(game.dealer)}**)`
+        : `**Dealer:** [🂠] ${game.dealer.slice(1).map(c => `${c.rank}${c.suit}`).join(' ')} (**${bjVal(game.dealer[1])}** + ?)`;
+
+    return new EmbedBuilder()
+        .setTitle('🃏 Blackjack')
+        .setDescription(
+            `**Jouw hand:** ${bjFmt(game.player)} (**${pt}**)\n` +
+            `${dealerLine}\n\n` +
+            `${status}\n\n**Inzet:** ${game.bet} chips`
+        )
+        .setColor(color || CASINO_GOLD)
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
+}
+
+function bjBuildRows(gameId) {
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`bj_hit_${gameId}`).setLabel('Hit').setEmoji('🃏').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`bj_stand_${gameId}`).setLabel('Stand').setEmoji('✋').setStyle(ButtonStyle.Success)
+    )];
+}
+
+async function finishBlackjack(interaction, game, reason, isUpdate = false) {
+    game.finished = true;
+    blackjackGames.delete(game.id || '');
+
+    const pt = bjTotal(game.player);
+    let result, payout, color;
+
+    if (reason === 'player_blackjack') {
+        result = '🎉 **BLACKJACK!** Je wint 2x!';
+        payout = game.bet * 2;
+        color = CASINO_GREEN;
+    } else if (pt > 21) {
+        result = `💥 Bust met **${pt}**. Je verliest.`;
+        payout = 0;
+        color = CASINO_RED;
+    } else {
+        // Dealer hit tot >= 17
+        while (bjTotal(game.dealer) < 17) game.dealer.push(bjDraw());
+        const dt = bjTotal(game.dealer);
+        if (dt > 21) { result = `🎉 Dealer bust met **${dt}**! Je wint!`; payout = game.bet * 2; color = CASINO_GREEN; }
+        else if (pt > dt) { result = `🎉 Je wint! **${pt}** vs **${dt}**.`; payout = game.bet * 2; color = CASINO_GREEN; }
+        else if (pt < dt) { result = `💀 Je verliest. **${pt}** vs **${dt}**.`; payout = 0; color = CASINO_RED; }
+        else { result = `🤝 Gelijkspel! **${pt}** vs **${dt}**.`; payout = game.bet; color = CASINO_GOLD; }
+    }
+
+    const user = getCasinoUser(game.userId);
+    user.chips += payout;
+    if (payout > game.bet) user.wins += 1;
+    else if (payout === 0) user.losses += 1;
+    user.gamesPlayed += 1;
+    await saveToGist();
+
+    const embed = new EmbedBuilder()
+        .setTitle('🃏 Blackjack')
+        .setDescription(
+            `**Jouw hand:** ${bjFmt(game.player)} (**${pt}**)\n` +
+            `**Dealer:** ${bjFmt(game.dealer)} (**${bjTotal(game.dealer)}**)\n\n` +
+            `${result}\n\n**Inzet:** ${game.bet} chips\n**Nieuwe balans:** ${user.chips} chips`
+        )
+        .setColor(color)
+        .setThumbnail(CONFIG.LOGO_URL)
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+        .setTimestamp();
+
+    await updateCasinoLeaderboard();
+    await updateCasinoPanel();
+
+    if (isUpdate) {
+        await interaction.update({ embeds: [embed], components: [] }).catch(() => {});
+    } else {
+        await interaction.reply({ embeds: [embed] }).catch(() => {});
+    }
+}
+
 async function playBlackjack(interaction, bet) {
     const user = getCasinoUser(interaction.user.id);
     if (user.chips <= 0) {
@@ -725,46 +858,53 @@ async function playBlackjack(interaction, bet) {
     if (bet < 1) return interaction.reply({ content: '❌ Minstens **1 chip**.', flags: MessageFlags.Ephemeral });
     if (bet > user.chips) return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
 
-    const suits = ['♠️', '♥️', '♦️', '♣️'];
-    const ranks = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
-    const draw = () => ({ suit: suits[Math.floor(Math.random() * 4)], rank: ranks[Math.floor(Math.random() * 13)] });
-    const val = (c) => c.rank === 'A' ? 11 : ['J', 'Q', 'K'].includes(c.rank) ? 10 : parseInt(c.rank, 10);
-    const total = (h) => { let t = 0, a = 0; for (const c of h) { t += val(c); if (c.rank === 'A') a++; } while (t > 21 && a > 0) { t -= 10; a--; } return t; };
-    const fmt = (h) => h.map(c => `${c.rank}${c.suit}`).join(' ');
+    const player = [bjDraw(), bjDraw()];
+    const dealer = [bjDraw(), bjDraw()];
 
-    const player = [draw(), draw()];
-    const dealer = [draw(), draw()];
-    const pt = total(player);
-    const dt = total(dealer);
-
-    let result, winnings, color;
-    if (pt === 21 && dt === 21) { result = '🤝 Gelijkspel (beide blackjack).'; winnings = 0; color = CASINO_GOLD; }
-    else if (pt === 21) { result = '🎉 **BLACKJACK!** Je wint 2x!'; winnings = bet * 2; color = CASINO_GREEN; }
-    else if (dt === 21) { result = '💀 Dealer blackjack. Je verliest.'; winnings = -bet; color = CASINO_RED; }
-    else {
-        while (total(dealer) < 17) dealer.push(draw());
-        const fp = total(player), fd = total(dealer);
-        if (fp > 21) { result = `💥 Bust met **${fp}**.`; winnings = -bet; color = CASINO_RED; }
-        else if (fd > 21) { result = `🎉 Dealer bust met **${fd}**! Je wint 2x!`; winnings = bet; color = CASINO_GREEN; }
-        else if (fp > fd) { result = `🎉 Je wint! **${fp}** vs **${fd}**.`; winnings = bet; color = CASINO_GREEN; }
-        else if (fp < fd) { result = `💀 Je verliest. **${fp}** vs **${fd}**.`; winnings = -bet; color = CASINO_RED; }
-        else { result = `🤝 Gelijkspel! **${fp}** vs **${fd}**.`; winnings = 0; color = CASINO_GOLD; }
-    }
-
-    const newChips = Math.max(0, user.chips + winnings);
-    casino[interaction.user.id] = { chips: newChips, wins: user.wins + (winnings > 0 ? 1 : 0), losses: user.losses + (winnings < 0 ? 1 : 0), gamesPlayed: user.gamesPlayed + 1 };
+    user.chips -= bet;
     await saveToGist();
 
-    const embed = new EmbedBuilder()
-        .setTitle('🃏 Blackjack')
-        .setDescription(`**Jouw hand:** ${fmt(player)} (**${pt}**)\n**Dealer:** ${fmt(dealer)} (**${dt}**)\n\n${result}\n\n**Inzet:** ${bet} chips\n**Nieuwe balans:** ${newChips} chips`)
-        .setColor(color).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
+    const gameId = `${interaction.user.id}_${Date.now()}`;
+    const game = { id: gameId, userId: interaction.user.id, bet, player, dealer, finished: false };
+    blackjackGames.set(gameId, game);
 
-    await interaction.reply({ embeds: [embed] });
-    await updateCasinoLeaderboard();
-    await updateCasinoPanel();
+    if (bjTotal(player) === 21) {
+        return finishBlackjack(interaction, game, 'player_blackjack', false);
+    }
+
+    await interaction.reply({
+        embeds: [bjBuildEmbed(game, 'Kies **Hit** om nog een kaart te trekken, of **Stand** om te stoppen.', CASINO_GOLD)],
+        components: bjBuildRows(gameId)
+    });
 }
 
+async function handleBjHit(interaction, gameId) {
+    const game = blackjackGames.get(gameId);
+    if (!game) return interaction.reply({ content: 'Deze game is verlopen.', flags: MessageFlags.Ephemeral });
+    if (game.userId !== interaction.user.id) return interaction.reply({ content: 'Dit is niet jouw game.', flags: MessageFlags.Ephemeral });
+    if (game.finished) return interaction.reply({ content: 'Deze game is al klaar.', flags: MessageFlags.Ephemeral });
+
+    game.player.push(bjDraw());
+    const pt = bjTotal(game.player);
+
+    if (pt > 21) return finishBlackjack(interaction, game, 'player_bust', true);
+    if (pt === 21) return finishBlackjack(interaction, game, 'player_stand', true);
+
+    return interaction.update({
+        embeds: [bjBuildEmbed(game, 'Kies **Hit** of **Stand**.', CASINO_GOLD)],
+        components: bjBuildRows(gameId)
+    });
+}
+
+async function handleBjStand(interaction, gameId) {
+    const game = blackjackGames.get(gameId);
+    if (!game) return interaction.reply({ content: 'Deze game is verlopen.', flags: MessageFlags.Ephemeral });
+    if (game.userId !== interaction.user.id) return interaction.reply({ content: 'Dit is niet jouw game.', flags: MessageFlags.Ephemeral });
+    if (game.finished) return interaction.reply({ content: 'Deze game is al klaar.', flags: MessageFlags.Ephemeral });
+    return finishBlackjack(interaction, game, 'player_stand', true);
+}
+
+// --- ROULETTE ---
 async function playRoulette(interaction, bet, choice) {
     const user = getCasinoUser(interaction.user.id);
     if (user.chips <= 0) {
@@ -775,34 +915,54 @@ async function playRoulette(interaction, bet, choice) {
     if (bet > user.chips) return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
 
     const c = choice.toLowerCase();
-    if (!['rood', 'zwart', 'groen'].includes(c)) return interaction.reply({ content: '❌ Kies rood, zwart of groen.', flags: MessageFlags.Ephemeral });
+    if (!['rood', 'zwart', 'groen'].includes(c)) {
+        return interaction.reply({ content: '❌ Kies rood, zwart of groen.', flags: MessageFlags.Ephemeral });
+    }
+
+    // Inzet eerst aftrekken
+    user.chips -= bet;
 
     const n = Math.floor(Math.random() * 37);
     const isGreen = n === 0;
-    const isRed = !isGreen && [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36].includes(n);
+    const redNumbers = [1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36];
+    const isRed = !isGreen && redNumbers.includes(n);
 
-    let result, winnings, color;
+    let result, payout, color;
     if (isGreen) {
-        result = `🟢 **${n} GROEN!**`; color = CASINO_GREEN;
-        if (c === 'groen') { winnings = bet * 14; result += ' Je wint **14x**!'; }
-        else { winnings = -bet; result += ' Je verliest.'; color = CASINO_RED; }
+        color = CASINO_GREEN;
+        result = `🟢 **${n} GROEN!**`;
+        if (c === 'groen') { payout = bet * 14; result += ' Je wint **14x**!'; }
+        else { payout = 0; result += ' Je verliest.'; color = CASINO_RED; }
     } else if (isRed) {
-        result = `🔴 **${n} ROOD!**`; color = CASINO_RED;
-        if (c === 'rood') { winnings = bet; result += ' Je wint **2x**!'; color = CASINO_GREEN; }
-        else { winnings = -bet; result += ' Je verliest.'; }
+        color = CASINO_RED;
+        result = `🔴 **${n} ROOD!**`;
+        if (c === 'rood') { payout = bet * 2; result += ' Je wint **2x**!'; color = CASINO_GREEN; }
+        else { payout = 0; result += ' Je verliest.'; }
     } else {
-        result = `⚫ **${n} ZWART!**`; color = '#2b2b2b';
-        if (c === 'zwart') { winnings = bet; result += ' Je wint **2x**!'; color = CASINO_GREEN; }
-        else { winnings = -bet; result += ' Je verliest.'; color = CASINO_RED; }
+        color = '#2b2b2b';
+        result = `⚫ **${n} ZWART!**`;
+        if (c === 'zwart') { payout = bet * 2; result += ' Je wint **2x**!'; color = CASINO_GREEN; }
+        else { payout = 0; result += ' Je verliest.'; }
     }
 
-    const newChips = Math.max(0, user.chips + winnings);
-    casino[interaction.user.id] = { chips: newChips, wins: user.wins + (winnings > 0 ? 1 : 0), losses: user.losses + (winnings < 0 ? 1 : 0), gamesPlayed: user.gamesPlayed + 1 };
+    const newChips = Math.max(0, user.chips + payout);
+    casino[interaction.user.id] = {
+        chips: newChips,
+        wins: user.wins + (payout > bet ? 1 : 0),
+        losses: user.losses + (payout === 0 ? 1 : 0),
+        gamesPlayed: user.gamesPlayed + 1
+    };
     await saveToGist();
 
     const embed = new EmbedBuilder()
         .setTitle('🎡 Roulette')
-        .setDescription(`${result}\n\n**Jouw keuze:** ${c}\n**Inzet:** ${bet} chips\n**Nieuwe balans:** ${newChips} chips`)
+        .setDescription(
+            `${result}\n\n` +
+            `**Jouw keuze:** ${c}\n` +
+            `**Inzet:** ${bet} chips\n` +
+            `**Uitbetaling:** ${payout} chips\n` +
+            `**Nieuwe balans:** ${newChips} chips`
+        )
         .setColor(color).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 
     await interaction.reply({ embeds: [embed] });
@@ -810,7 +970,7 @@ async function playRoulette(interaction, bet, choice) {
     await updateCasinoPanel();
 }
 
-// --- CRASHER (max 25x) ---
+// --- CRASHER ---
 function buildCrasherEmbed(game, multiplier, status, color) {
     return new EmbedBuilder()
         .setTitle('🚀 Crasher')
@@ -1166,7 +1326,12 @@ client.once('ready', async () => {
             new SlashCommandBuilder().setName('blackjack').setDescription('Speel blackjack').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)),
             new SlashCommandBuilder().setName('roulette').setDescription('Speel roulette').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)).addStringOption(o => o.setName('kleur').setDescription('rood, zwart of groen').setRequired(true).addChoices({ name: 'rood', value: 'rood' }, { name: 'zwart', value: 'zwart' }, { name: 'groen', value: 'groen' })),
             new SlashCommandBuilder().setName('crasher').setDescription('Speel crasher').addIntegerOption(o => o.setName('inzet').setDescription('Chips').setRequired(true).setMinValue(1).setMaxValue(10000)),
-            new SlashCommandBuilder().setName('chips').setDescription('Bekijk je chips')
+            new SlashCommandBuilder().setName('chips').setDescription('Bekijk je chips'),
+            new SlashCommandBuilder()
+                .setName('givechips')
+                .setDescription('Geef chips aan een gebruiker (alleen eigenaar)')
+                .addUserOption(o => o.setName('user').setDescription('Ontvanger').setRequired(true))
+                .addIntegerOption(o => o.setName('amount').setDescription('Aantal chips').setRequired(true).setMinValue(1).setMaxValue(1000000))
         ].map(c => c.toJSON());
         await client.application.commands.set(commands);
         console.log('Slash commands geregistreerd');
@@ -1207,15 +1372,10 @@ client.once('ready', async () => {
     } catch (err) {}
 
     try {
-        const countingChannel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID);
-        if (countingChannel) {
-            const state = countingState[countingChannel.id] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
-            if (!state.highScore) state.highScore = 0;
-            countingState[countingChannel.id] = state;
-            const sent = await countingChannel.send({ embeds: [buildCountingEmbed(state)] });
-            state.lastMessageId = sent.id;
-            countingState[countingChannel.id] = state;
-        }
+        const state = countingState[CONFIG.COUNTING_CHANNEL_ID] || { current: 0, lastUserId: null, highScore: 0, lastMessageId: null };
+        if (!state.highScore) state.highScore = 0;
+        countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
+        await resetCountingChannel(state);
     } catch (err) {}
 
     await updateCasinoPanel();
@@ -1486,7 +1646,7 @@ client.on('interactionCreate', async (interaction) => {
                 state.current = 0; state.lastUserId = null;
                 countingState[CONFIG.COUNTING_CHANNEL_ID] = state;
                 await saveToGist();
-                await updateCountingEmbed(state);
+                await resetCountingChannel(state);
                 return interaction.editReply({ content: '✅ Gereset. Highscore bewaard.' });
             }
             return interaction.reply({ content: 'Onbekend.', flags: MessageFlags.Ephemeral });
@@ -1500,6 +1660,27 @@ client.on('interactionCreate', async (interaction) => {
             const u = getCasinoUser(interaction.user.id);
             const embed = new EmbedBuilder().setTitle('🪙 Jouw chips').setDescription(`**Chips:** ${u.chips}\n**Wins:** ${u.wins}\n**Losses:** ${u.losses}\n**Games:** ${u.gamesPlayed}`).setColor(CASINO_GOLD).setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 })).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
             return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+        }
+
+        if (interaction.commandName === 'givechips') {
+            if (interaction.user.id !== CONFIG.CHIP_GIVER_ID) {
+                return interaction.reply({ content: '❌ Geen toestemming.', flags: MessageFlags.Ephemeral });
+            }
+            const target = interaction.options.getUser('user');
+            const amount = interaction.options.getInteger('amount');
+            if (target.bot) return interaction.reply({ content: '❌ Kan geen chips aan een bot geven.', flags: MessageFlags.Ephemeral });
+            const u = getCasinoUser(target.id);
+            u.chips += amount;
+            await saveToGist();
+            await updateCasinoLeaderboard();
+            const embed = new EmbedBuilder()
+                .setTitle('🪙 Chips gegeven')
+                .setDescription(`**Van:** <@${interaction.user.id}>\n**Aan:** <@${target.id}>\n**Bedrag:** +${amount} chips\n**Nieuwe balans van ontvanger:** ${u.chips} chips`)
+                .setColor(CASINO_GOLD)
+                .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 128 }))
+                .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+                .setTimestamp();
+            return interaction.reply({ embeds: [embed] });
         }
         return;
     }
@@ -1673,6 +1854,8 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.update({ content: '✅ Je chips zijn gereset naar **100**.', components: [] });
     }
 
+    if (interaction.customId.startsWith('bj_hit_')) return handleBjHit(interaction, interaction.customId.replace('bj_hit_', ''));
+    if (interaction.customId.startsWith('bj_stand_')) return handleBjStand(interaction, interaction.customId.replace('bj_stand_', ''));
     if (interaction.customId.startsWith('crash_cashout_')) return handleCrashCashout(interaction, interaction.customId.replace('crash_cashout_', ''));
 
     if (interaction.customId.startsWith('gw_join_') || (interaction.customId.startsWith('gw_reroll_') && !interaction.customId.startsWith('gw_reroll_old_') && !interaction.customId.startsWith('gw_reroll_new_'))) return handleGiveawayButton(interaction);
