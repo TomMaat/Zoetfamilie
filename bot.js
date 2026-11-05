@@ -75,7 +75,7 @@ const CONFIG = {
     GIVEAWAY_LOG_ID: '1567663764181098636',
     ROLE_MANAGER_LOG_ID: '1567664373739163698',
 
-    COUNTING_CHANNEL_ID: '1567857095989264485',
+    COUNTING_CHANNEL_ID: '1567875455921557574',
     CASINO_CHANNEL_ID: '1567863335620321401',
     CASINO_LEADERBOARD_CHANNEL_ID: '1567863557524033568',
 
@@ -761,29 +761,69 @@ async function updateCasinoPanel() {
     } catch (err) {}
 }
 
-// --- BLACKJACK ---
+// --- BLACKJACK (duidelijk & realistisch) ---
 const BJ_SUITS = ['♠️', '♥️', '♦️', '♣️'];
 const BJ_RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 const bjDraw = () => ({ suit: BJ_SUITS[Math.floor(Math.random() * 4)], rank: BJ_RANKS[Math.floor(Math.random() * 13)] });
 const bjVal = (c) => c.rank === 'A' ? 11 : ['J', 'Q', 'K'].includes(c.rank) ? 10 : parseInt(c.rank, 10);
 const bjTotal = (h) => { let t = 0, a = 0; for (const c of h) { t += bjVal(c); if (c.rank === 'A') a++; } while (t > 21 && a > 0) { t -= 10; a--; } return t; };
-const bjFmt = (h) => h.map(c => `${c.rank}${c.suit}`).join(' ');
+const bjCardStr = (c) => `\`${c.rank}${c.suit}\``;
+
+// Toon een hand als rij kaarten: [A♠️] [K♥️] [7♦️]
+function bjHandStr(hand) {
+    if (!hand || hand.length === 0) return '_geen kaarten_';
+    return hand.map(c => `\`${c.rank}${c.suit}\``).join(' ');
+}
+
+// Toon dealer hand: eerste kaart zichtbaar, rest verborgen
+function bjDealerHidden(dealer) {
+    if (!dealer || dealer.length === 0) return '_geen kaarten_';
+    const first = `\`${dealer[0].rank}${dealer[0].suit}\``;
+    const rest = dealer.slice(1).map(() => '`🂠`').join(' ');
+    return `${first} ${rest}`;
+}
 
 function bjBuildEmbed(game, status, color, revealDealer = false) {
     const pt = bjTotal(game.player);
-    const dealerLine = revealDealer
-        ? `**Dealer:** ${bjFmt(game.dealer)} (**${bjTotal(game.dealer)}**)`
-        : `**Dealer:** [🂠] ${game.dealer.slice(1).map(c => `${c.rank}${c.suit}`).join(' ')} (**${bjVal(game.dealer[1])}** + ?)`;
+    const dt = bjTotal(game.dealer);
+
+    let dealerLine, dealerTotalLine;
+    if (revealDealer) {
+        dealerLine = bjHandStr(game.dealer);
+        dealerTotalLine = `**${dt}**`;
+    } else {
+        dealerLine = bjDealerHidden(game.dealer);
+        dealerTotalLine = `**${bjVal(game.dealer[0])}** + ?`;
+    }
+
+    const user = getCasinoUser(game.userId);
 
     return new EmbedBuilder()
         .setTitle('🃏 Blackjack')
-        .setDescription(
-            `**Jouw hand:** ${bjFmt(game.player)} (**${pt}**)\n` +
-            `${dealerLine}\n\n` +
-            `${status}\n\n**Inzet:** ${game.bet} chips`
-        )
         .setColor(color || CASINO_GOLD)
         .setThumbnail(CONFIG.LOGO_URL)
+        .addFields(
+            {
+                name: '🎩 Dealer',
+                value: `${dealerLine}\nTotaal: ${dealerTotalLine}`,
+                inline: false
+            },
+            {
+                name: `👤 Jouw hand (${pt})`,
+                value: bjHandStr(game.player),
+                inline: false
+            },
+            {
+                name: '💰 Inzet',
+                value: `**${game.bet} chips**\nBalans: **${user.chips} chips**`,
+                inline: true
+            },
+            {
+                name: '📊 Status',
+                value: status,
+                inline: true
+            }
+        )
         .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
         .setTimestamp();
 }
@@ -807,17 +847,17 @@ async function finishBlackjack(interaction, game, reason, isUpdate = false) {
         payout = game.bet * 2;
         color = CASINO_GREEN;
     } else if (pt > 21) {
-        result = `💥 Bust met **${pt}**. Je verliest.`;
+        result = `💥 **Bust!** Je hebt **${pt}**. Je verliest.`;
         payout = 0;
         color = CASINO_RED;
     } else {
         // Dealer hit tot >= 17
         while (bjTotal(game.dealer) < 17) game.dealer.push(bjDraw());
         const dt = bjTotal(game.dealer);
-        if (dt > 21) { result = `🎉 Dealer bust met **${dt}**! Je wint!`; payout = game.bet * 2; color = CASINO_GREEN; }
-        else if (pt > dt) { result = `🎉 Je wint! **${pt}** vs **${dt}**.`; payout = game.bet * 2; color = CASINO_GREEN; }
-        else if (pt < dt) { result = `💀 Je verliest. **${pt}** vs **${dt}**.`; payout = 0; color = CASINO_RED; }
-        else { result = `🤝 Gelijkspel! **${pt}** vs **${dt}**.`; payout = game.bet; color = CASINO_GOLD; }
+        if (dt > 21) { result = `🎉 **Dealer bust!** Dealer heeft **${dt}**. Je wint!`; payout = game.bet * 2; color = CASINO_GREEN; }
+        else if (pt > dt) { result = `🎉 **Je wint!** Jij **${pt}** vs dealer **${dt}**.`; payout = game.bet * 2; color = CASINO_GREEN; }
+        else if (pt < dt) { result = `💀 **Je verliest.** Jij **${pt}** vs dealer **${dt}**.`; payout = 0; color = CASINO_RED; }
+        else { result = `🤝 **Push (gelijkspel).** Beide **${pt}**. Inzet terug.`; payout = game.bet; color = CASINO_GOLD; }
     }
 
     const user = getCasinoUser(game.userId);
@@ -827,18 +867,7 @@ async function finishBlackjack(interaction, game, reason, isUpdate = false) {
     user.gamesPlayed += 1;
     await saveToGist();
 
-    const embed = new EmbedBuilder()
-        .setTitle('🃏 Blackjack')
-        .setDescription(
-            `**Jouw hand:** ${bjFmt(game.player)} (**${pt}**)\n` +
-            `**Dealer:** ${bjFmt(game.dealer)} (**${bjTotal(game.dealer)}**)\n\n` +
-            `${result}\n\n**Inzet:** ${game.bet} chips\n**Nieuwe balans:** ${user.chips} chips`
-        )
-        .setColor(color)
-        .setThumbnail(CONFIG.LOGO_URL)
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-        .setTimestamp();
-
+    const embed = bjBuildEmbed(game, result, color, true);
     await updateCasinoLeaderboard();
     await updateCasinoPanel();
 
@@ -873,7 +902,7 @@ async function playBlackjack(interaction, bet) {
     }
 
     await interaction.reply({
-        embeds: [bjBuildEmbed(game, 'Kies **Hit** om nog een kaart te trekken, of **Stand** om te stoppen.', CASINO_GOLD)],
+        embeds: [bjBuildEmbed(game, 'Kies **Hit** of **Stand**', CASINO_GOLD)],
         components: bjBuildRows(gameId)
     });
 }
@@ -891,7 +920,7 @@ async function handleBjHit(interaction, gameId) {
     if (pt === 21) return finishBlackjack(interaction, game, 'player_stand', true);
 
     return interaction.update({
-        embeds: [bjBuildEmbed(game, 'Kies **Hit** of **Stand**.', CASINO_GOLD)],
+        embeds: [bjBuildEmbed(game, 'Kies **Hit** of **Stand**', CASINO_GOLD)],
         components: bjBuildRows(gameId)
     });
 }
@@ -919,7 +948,6 @@ async function playRoulette(interaction, bet, choice) {
         return interaction.reply({ content: '❌ Kies rood, zwart of groen.', flags: MessageFlags.Ephemeral });
     }
 
-    // Inzet eerst aftrekken
     user.chips -= bet;
 
     const n = Math.floor(Math.random() * 37);
@@ -1575,6 +1603,46 @@ async function checkEmptyCalls() {
 client.on('interactionCreate', async (interaction) => {
 
     if (interaction.isChatInputCommand()) {
+        // ----- CHIPS -----
+        if (interaction.commandName === 'chips') {
+            const u = getCasinoUser(interaction.user.id);
+            const embed = new EmbedBuilder()
+                .setTitle('🪙 Jouw chips')
+                .setDescription(`**Chips:** ${u.chips}\n**Wins:** ${u.wins}\n**Losses:** ${u.losses}\n**Games:** ${u.gamesPlayed}`)
+                .setColor(CASINO_GOLD)
+                .setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 }))
+                .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
+            return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
+        }
+
+        // ----- GIVECHIPS (alleen eigenaar) -----
+        if (interaction.commandName === 'givechips') {
+            if (interaction.user.id !== CONFIG.CHIP_GIVER_ID) {
+                return interaction.reply({ content: '❌ Geen toestemming.', flags: MessageFlags.Ephemeral });
+            }
+            const target = interaction.options.getUser('user');
+            const amount = interaction.options.getInteger('amount');
+            if (target.bot) return interaction.reply({ content: '❌ Kan geen chips aan een bot geven.', flags: MessageFlags.Ephemeral });
+            const u = getCasinoUser(target.id);
+            u.chips += amount;
+            await saveToGist();
+            await updateCasinoLeaderboard();
+            const embed = new EmbedBuilder()
+                .setTitle('🪙 Chips gegeven')
+                .setDescription(`**Van:** <@${interaction.user.id}>\n**Aan:** <@${target.id}>\n**Bedrag:** +${amount} chips\n**Nieuwe balans van ontvanger:** ${u.chips} chips`)
+                .setColor(CASINO_GOLD)
+                .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 128 }))
+                .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+                .setTimestamp();
+            return interaction.reply({ embeds: [embed] });
+        }
+
+        // ----- CASINO GAMES -----
+        if (interaction.commandName === 'blackjack') return playBlackjack(interaction, interaction.options.getInteger('inzet'));
+        if (interaction.commandName === 'roulette') return playRoulette(interaction, interaction.options.getInteger('inzet'), interaction.options.getString('kleur'));
+        if (interaction.commandName === 'crasher') return playCrasher(interaction, interaction.options.getInteger('inzet'));
+
+        // ----- MODERATIE / BEHEER -----
         if (interaction.commandName === 'clear') {
             if (!interaction.member.permissions.has(PermissionFlagsBits.ManageMessages)) return interaction.reply({ content: 'Geen toestemming.', flags: MessageFlags.Ephemeral });
             const amount = interaction.options.getInteger('amount');
@@ -1650,37 +1718,6 @@ client.on('interactionCreate', async (interaction) => {
                 return interaction.editReply({ content: '✅ Gereset. Highscore bewaard.' });
             }
             return interaction.reply({ content: 'Onbekend.', flags: MessageFlags.Ephemeral });
-        }
-
-        if (interaction.commandName === 'blackjack') return playBlackjack(interaction, interaction.options.getInteger('inzet'));
-        if (interaction.commandName === 'roulette') return playRoulette(interaction, interaction.options.getInteger('inzet'), interaction.options.getString('kleur'));
-        if (interaction.commandName === 'crasher') return playCrasher(interaction, interaction.options.getInteger('inzet'));
-
-        if (interaction.commandName === 'chips') {
-            const u = getCasinoUser(interaction.user.id);
-            const embed = new EmbedBuilder().setTitle('🪙 Jouw chips').setDescription(`**Chips:** ${u.chips}\n**Wins:** ${u.wins}\n**Losses:** ${u.losses}\n**Games:** ${u.gamesPlayed}`).setColor(CASINO_GOLD).setThumbnail(interaction.user.displayAvatarURL({ dynamic: true, size: 128 })).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
-            return interaction.reply({ embeds: [embed], flags: MessageFlags.Ephemeral });
-        }
-
-        if (interaction.commandName === 'givechips') {
-            if (interaction.user.id !== CONFIG.CHIP_GIVER_ID) {
-                return interaction.reply({ content: '❌ Geen toestemming.', flags: MessageFlags.Ephemeral });
-            }
-            const target = interaction.options.getUser('user');
-            const amount = interaction.options.getInteger('amount');
-            if (target.bot) return interaction.reply({ content: '❌ Kan geen chips aan een bot geven.', flags: MessageFlags.Ephemeral });
-            const u = getCasinoUser(target.id);
-            u.chips += amount;
-            await saveToGist();
-            await updateCasinoLeaderboard();
-            const embed = new EmbedBuilder()
-                .setTitle('🪙 Chips gegeven')
-                .setDescription(`**Van:** <@${interaction.user.id}>\n**Aan:** <@${target.id}>\n**Bedrag:** +${amount} chips\n**Nieuwe balans van ontvanger:** ${u.chips} chips`)
-                .setColor(CASINO_GOLD)
-                .setThumbnail(target.displayAvatarURL({ dynamic: true, size: 128 }))
-                .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-                .setTimestamp();
-            return interaction.reply({ embeds: [embed] });
         }
         return;
     }
