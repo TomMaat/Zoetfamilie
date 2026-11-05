@@ -1,4 +1,4 @@
-const http = require('http');
+const express = require('express');
 const crypto = require('crypto');
 const {
     Client,
@@ -22,14 +22,151 @@ const {
     OverwriteType
 } = require('discord.js');
 
+// --- WEBSERVER VOOR OAUTH2 ---
+const app = express();
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end('Familie Snus bot is online');
-}).listen(PORT, () => {
-    console.log(`HTTP server luistert op poort ${PORT}`);
+
+app.get('/', (req, res) => {
+    const clientId = process.env.DISCORD_CLIENT_ID;
+    const redirectUri = encodeURIComponent(process.env.DISCORD_REDIRECT_URI);
+    const url = `https://discord.com/oauth2/authorize?client_id=${clientId}&response_type=code&redirect_uri=${redirectUri}&scope=identify`;
+
+    res.send(`
+        <!DOCTYPE html>
+        <html lang="nl">
+        <head>
+            <meta charset="UTF-8">
+            <title>Familie Snus Verify</title>
+            <style>
+                body { font-family: Arial, sans-serif; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; margin: 0; background: #2b2d31; color: white; }
+                h1 { margin-bottom: 30px; }
+                a { padding: 15px 30px; background: #5865f2; color: white; text-decoration: none; border-radius: 8px; font-size: 18px; }
+                a:hover { background: #4752c4; }
+            </style>
+        </head>
+        <body>
+            <h1>Familie Snus Verify</h1>
+            <a href="${url}">Login met Discord</a>
+        </body>
+        </html>
+    `);
 });
 
+app.get('/callback', async (req, res) => {
+    const code = req.query.code;
+    if (!code) return res.send('Geen code ontvangen. Probeer opnieuw.');
+
+    try {
+        const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: process.env.DISCORD_CLIENT_ID,
+                client_secret: process.env.DISCORD_CLIENT_SECRET,
+                grant_type: 'authorization_code',
+                code: code,
+                redirect_uri: process.env.DISCORD_REDIRECT_URI
+            })
+        });
+        const tokenData = await tokenRes.json();
+
+        if (!tokenData.access_token) {
+            return res.send('Login mislukt. Probeer opnieuw.');
+        }
+
+        const userRes = await fetch('https://discord.com/api/users/@me', {
+            headers: { Authorization: `Bearer ${tokenData.access_token}` }
+        });
+        const user = await userRes.json();
+
+        const VERIFY_WEBHOOK_URL = process.env.VERIFY_WEBHOOK_URL;
+        const MIN_ACCOUNT_AGE_DAYS = parseInt(process.env.MIN_ACCOUNT_AGE_DAYS || '7', 10);
+
+        const accountCreatedMs = Number(BigInt(user.id) >> 22n) + 1420070400000;
+        const accountAgeDays = Math.floor((Date.now() - accountCreatedMs) / (1000 * 60 * 60 * 24));
+
+        let roleGiven = false;
+        let roleMessage = '';
+        let tooYoung = false;
+
+        try {
+            const guild = client.guilds.cache.first();
+            if (guild) {
+                const member = await guild.members.fetch(user.id).catch(() => null);
+                const role = guild.roles.cache.get(CONFIG.VERIFY_ROLE_ID);
+
+                if (!member) {
+                    roleMessage = 'Je zit nog niet in de Discord-server. Join eerst de server en probeer opnieuw.';
+                } else if (!role) {
+                    roleMessage = 'De verify-rol kon niet gevonden worden. Neem contact op met een admin.';
+                } else if (member.roles.cache.has(CONFIG.VERIFY_ROLE_ID)) {
+                    roleMessage = 'Je had de verify-rol al.';
+                } else if (accountAgeDays < MIN_ACCOUNT_AGE_DAYS) {
+                    tooYoung = true;
+                    roleMessage = `Je account is nog te jong (${accountAgeDays} dagen). Je moet minstens ${MIN_ACCOUNT_AGE_DAYS} dagen oud zijn om te verifiëren. Neem contact op met een admin als je denkt dat dit een fout is.`;
+                } else {
+                    await member.roles.add(role, 'Verify via web login');
+                    roleGiven = true;
+                    roleMessage = 'Je bent geverifieerd! De verify-rol is aan je gegeven.';
+                }
+
+                if (VERIFY_WEBHOOK_URL) {
+                    const avatarUrl = user.avatar
+                        ? `https://cdn.discordapp.com/avatars/${user.id}/${user.avatar}.png`
+                        : `https://cdn.discordapp.com/embed/avatars/0.png`;
+
+                    await fetch(VERIFY_WEBHOOK_URL, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            content: `Verify poging: **${user.username}** (\`${user.id}\`)`,
+                            embeds: [{
+                                title: roleGiven ? '✅ Verify gelukt' : (tooYoung ? '⚠️ Verify geweigerd (account te jong)' : 'ℹ️ Verify poging'),
+                                color: roleGiven ? 0x2ecc71 : (tooYoung ? 0xe67e22 : 0x9b59b6),
+                                thumbnail: { url: avatarUrl },
+                                fields: [
+                                    { name: 'User ID', value: `\`${user.id}\``, inline: true },
+                                    { name: 'Account leeftijd', value: `${accountAgeDays} dagen`, inline: true },
+                                    { name: 'Account gemaakt', value: `<t:${Math.floor(accountCreatedMs / 1000)}:R>`, inline: true },
+                                    { name: 'In server', value: member ? 'Ja' : 'Nee', inline: true },
+                                    { name: 'Verify rol', value: roleGiven ? 'Gegeven' : (member?.roles.cache.has(CONFIG.VERIFY_ROLE_ID) ? 'Had al' : 'Niet gegeven'), inline: true },
+                                    { name: 'Verdacht', value: (accountAgeDays < 7 ? 'Ja (jong account)' : (user.avatar ? 'Nee' : 'Ja (geen avatar)')), inline: true }
+                                ],
+                                timestamp: new Date().toISOString()
+                            }]
+                        })
+                    }).catch(err => console.error('Webhook fout:', err));
+                }
+            } else {
+                roleMessage = 'De bot is niet verbonden met een server.';
+            }
+        } catch (err) {
+            console.error('Fout bij verify:', err);
+            roleMessage = 'Er ging iets mis bij het verifiëren.';
+        }
+
+        res.send(`
+            <!DOCTYPE html>
+            <html lang="nl">
+            <head><meta charset="UTF-8"><title>Ingelogd</title></head>
+            <body style="font-family: Arial; background: #2b2d31; color: white; text-align: center; padding-top: 50px;">
+                <h1>Welkom, ${user.username}!</h1>
+                <p>${roleMessage}</p>
+                <p>Je kan dit venster sluiten.</p>
+            </body>
+            </html>
+        `);
+    } catch (err) {
+        console.error('OAuth fout:', err);
+        res.send('Er ging iets mis tijdens het inloggen.');
+    }
+});
+
+app.listen(PORT, () => {
+    console.log(`Webserver luistert op poort ${PORT}`);
+});
+
+// --- INSTELLINGEN ---
 const PURPLE = {
     main: '#9b59b6',
     dark: '#7d3c98',
@@ -70,6 +207,8 @@ const CONFIG = {
     GIVEAWAY_CHANNEL_ID: '1567283972306636993',
     GIVEAWAY_LOG_ID: '1567663764181098636',
     ROLE_MANAGER_LOG_ID: '1567664373739163698',
+
+    COUNTING_CHANNEL_ID: '1567857095989264485',
 
     CUSTOM_ROLE_MANAGER_ROLE_ID: '1567237645057261689',
     GIVEAWAY_MANAGER_ROLE_ID: '1567237645057261689',
@@ -117,6 +256,9 @@ const DEFAULT_CUSTOM_ROLES = [
 
 let customRoles = [];
 let giveaways = {};
+
+// Telling state per kanaal
+let countingState = {}; // { channelId: { current: 0, lastUserId: null } }
 
 const GIST_FILE = 'zoet.json';
 let gistId = CONFIG.GIST_ID;
@@ -168,7 +310,8 @@ async function initGist() {
                             joinTimes: {},
                             customRoles: DEFAULT_CUSTOM_ROLES.map((r, i) => ({ ...r, order: i })),
                             backups: {},
-                            giveaways: {}
+                            giveaways: {},
+                            countingState: {}
                         }, null, 2)
                     }
                 }
@@ -199,6 +342,7 @@ async function loadFromGist() {
             if (Array.isArray(data.customRoles)) customRoles = data.customRoles;
             if (data.backups) backups = data.backups;
             if (data.giveaways) giveaways = data.giveaways;
+            if (data.countingState) countingState = data.countingState;
         }
     } catch (err) {
         console.error('Fout bij laden database:', err.message);
@@ -246,7 +390,8 @@ async function saveToGist() {
                         joinTimes,
                         customRoles,
                         backups,
-                        giveaways
+                        giveaways,
+                        countingState
                     }, null, 2)
                 }
             }
@@ -674,7 +819,6 @@ async function handleAntiLink(message) {
     if (message.author.bot) return false;
     if (!message.guild) return false;
 
-    // Bypass voor moderators en de manager rol
     if (message.member?.permissions.has(PermissionFlagsBits.ManageMessages)) return false;
     if (message.member?.roles?.cache?.has(CONFIG.CUSTOM_ROLE_MANAGER_ROLE_ID)) return false;
 
@@ -727,662 +871,57 @@ async function handleAntiLink(message) {
     }
 }
 
-function buildGiveawayEmbed(giveaway) {
-    const ended = giveaway.ended;
-    return new EmbedBuilder()
-        .setTitle(ended ? '🎉 Giveaway afgelopen' : '🎉 Giveaway')
-        .setDescription(
-            `**Prijs:** ${giveaway.prize}\n\n` +
-            (ended
-                ? `**Winnaar(s):** ${giveaway.winners?.map(id => `<@${id}>`).join(', ') || '_Geen deelnemers_'}`
-                : `**Eindigt:** <t:${Math.floor(giveaway.endsAt / 1000)}:R>\n**Deelnemers:** ${giveaway.participants.length}`)
-        )
-        .setColor(PURPLE.main)
-        .setThumbnail(CONFIG.LOGO_URL)
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-        .setTimestamp();
-}
+// --- COUNTING GAME ---
+async function handleCountingMessage(message) {
+    if (message.author.bot) return;
+    if (message.channel.id !== CONFIG.COUNTING_CHANNEL_ID) return;
 
-function buildGiveawayRows(messageId, ended) {
-    const rows = [];
+    const state = countingState[message.channel.id] || { current: 0, lastUserId: null };
 
-    if (!ended) {
-        rows.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`gw_join_${messageId}`)
-                    .setLabel('Deelnemen')
-                    .setEmoji('🎉')
-                    .setStyle(ButtonStyle.Success)
-            )
-        );
-    } else {
-        rows.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`gw_reroll_${messageId}`)
-                    .setLabel('Reroll')
-                    .setEmoji('🔁')
-                    .setStyle(ButtonStyle.Primary)
-            )
-        );
-    }
+    const content = message.content.trim();
+    const numberMatch = content.match(/^(\d+)$/);
 
-    return rows;
-}
-
-async function startGiveawayTimer(messageId) {
-    const gw = giveaways[messageId];
-    if (!gw) return;
-    const delay = gw.endsAt - Date.now();
-    setTimeout(async () => {
-        await endGiveaway(messageId);
-    }, Math.max(0, delay));
-}
-
-async function endGiveaway(messageId) {
-    const gw = giveaways[messageId];
-    if (!gw || gw.ended) return;
-
-    gw.ended = true;
-
-    if (gw.participants.length === 0) {
-        gw.winners = [];
-    } else {
-        const winners = [];
-        const pool = [...gw.participants];
-        for (let i = 0; i < Math.min(gw.winnersCount || 1, pool.length); i++) {
-            const idx = Math.floor(Math.random() * pool.length);
-            winners.push(pool[idx]);
-            pool.splice(idx, 1);
-        }
-        gw.winners = winners;
-    }
-
-    await saveToGist();
-
-    try {
-        const channel = await client.channels.fetch(gw.channelId);
-        const msg = await channel.messages.fetch(messageId);
-        await msg.edit({
-            embeds: [buildGiveawayEmbed(gw)],
-            components: buildGiveawayRows(messageId, true)
-        });
-        if (gw.winners.length > 0) {
-            await channel.send(`🎉 Gefeliciteerd ${gw.winners.map(id => `<@${id}>`).join(', ')}! Je hebt **${gw.prize}** gewonnen.`);
-        } else {
-            await channel.send(`😢 Niemand deed mee aan de giveaway voor **${gw.prize}**.`);
-        }
-    } catch (err) {
-        console.error('Fout bij einde giveaway:', err);
-    }
-
-    const guild = client.guilds.cache.first();
-    if (guild) {
-        await sendLog(guild, CONFIG.GIVEAWAY_LOG_ID, {
-            title: '🏁 Giveaway afgelopen',
-            description:
-                `**Prijs:** ${gw.prize}\n` +
-                `**Winnaar(s):** ${gw.winners.length > 0 ? gw.winners.map(id => `<@${id}>`).join(', ') : '_Geen deelnemers_'}\n` +
-                `**Deelnemers:** ${gw.participants.length}`,
-            color: PURPLE.dark
-        });
-    }
-}
-
-async function handleGiveawayButton(interaction) {
-    const customId = interaction.customId;
-
-    if (customId.startsWith('gw_join_')) {
-        const messageId = customId.replace('gw_join_', '');
-        const gw = giveaways[messageId];
-        if (!gw) {
-            return interaction.reply({ content: 'Deze giveaway bestaat niet meer.', flags: MessageFlags.Ephemeral });
-        }
-        if (gw.ended) {
-            return interaction.reply({ content: 'Deze giveaway is al afgelopen.', flags: MessageFlags.Ephemeral });
-        }
-        if (gw.participants.includes(interaction.user.id)) {
-            return interaction.reply({ content: 'Je doet al mee.', flags: MessageFlags.Ephemeral });
-        }
-        gw.participants.push(interaction.user.id);
+    if (!numberMatch) {
+        // Geen geldig getal: verwijder bericht en reageer met ❌
+        await message.delete().catch(() => {});
+        countingState[message.channel.id] = { current: 0, lastUserId: null };
         await saveToGist();
-        try {
-            const channel = await client.channels.fetch(gw.channelId);
-            const msg = await channel.messages.fetch(messageId);
-            await msg.edit({ embeds: [buildGiveawayEmbed(gw)], components: buildGiveawayRows(messageId, false) });
-        } catch (err) {}
-        return interaction.reply({ content: '🎉 Je doet mee!', flags: MessageFlags.Ephemeral });
+        await message.channel.send({
+            content: `${message.author} - Dat is geen geldig getal. Het spel begint opnieuw bij **1**.`
+        }).catch(() => {});
+        return;
     }
 
-    if (customId.startsWith('gw_reroll_')) {
-        const messageId = customId.replace('gw_reroll_', '');
-        const gw = giveaways[messageId];
-        if (!gw) {
-            return interaction.reply({ content: 'Deze giveaway bestaat niet meer.', flags: MessageFlags.Ephemeral });
-        }
-        if (!isGiveawayManager(interaction)) {
-            return interaction.reply({ content: 'Je hebt geen toestemming om te rerollen.', flags: MessageFlags.Ephemeral });
-        }
-        if (gw.participants.length === 0) {
-            return interaction.reply({ content: 'Er zijn geen deelnemers om te rerollen.', flags: MessageFlags.Ephemeral });
-        }
-        if (!gw.winners || gw.winners.length === 0) {
-            return interaction.reply({ content: 'Deze giveaway heeft nog geen winnaar.', flags: MessageFlags.Ephemeral });
-        }
+    const typedNumber = parseInt(numberMatch[1], 10);
 
-        const options = gw.winners.map(id => ({
-            label: `Oude winnaar: ${id}`,
-            value: id
-        }));
-
-        const select = new StringSelectMenuBuilder()
-            .setCustomId(`gw_reroll_old_${messageId}`)
-            .setPlaceholder('Kies de oude winnaar die niet heeft geclaimd')
-            .addOptions(options);
-
-        return interaction.reply({
-            content: 'Kies de oude winnaar die niet heeft geclaimd:',
-            components: [new ActionRowBuilder().addComponents(select)],
-            flags: MessageFlags.Ephemeral
-        });
+    // Dubbele user achter elkaar
+    if (state.lastUserId === message.author.id) {
+        await message.delete().catch(() => {});
+        countingState[message.channel.id] = { current: 0, lastUserId: null };
+        await saveToGist();
+        await message.channel.send({
+            content: `${message.author} - Je mag niet 2x achter elkaar. Het spel begint opnieuw bij **1**.`
+        }).catch(() => {});
+        return;
     }
-}
 
-// --- BACKUP SYSTEEM ---
-function generateBackupId() {
-    return crypto.randomBytes(4).toString('hex').toUpperCase();
-}
+    // Fout getal
+    if (typedNumber !== state.current + 1) {
+        await message.react('❌').catch(() => {});
+        countingState[message.channel.id] = { current: 0, lastUserId: null };
+        await saveToGist();
+        await message.channel.send({
+            content: `${message.author} - Fout! Je moest **${state.current + 1}** typen. Het spel begint opnieuw bij **1**.`
+        }).catch(() => {});
+        return;
+    }
 
-async function createBackup(guild, user) {
-    const backupId = generateBackupId();
-
-    const roles = guild.roles.cache
-        .filter(r => r.id !== guild.id && !r.managed)
-        .map(r => ({
-            id: r.id,
-            name: r.name,
-            color: r.color,
-            hoist: r.hoist,
-            mentionable: r.mentionable,
-            position: r.position,
-            permissions: r.permissions.bitfield.toString()
-        }))
-        .sort((a, b) => a.position - b.position);
-
-    const categories = guild.channels.cache
-        .filter(c => c.type === ChannelType.GuildCategory)
-        .map(c => ({
-            id: c.id,
-            name: c.name,
-            position: c.position,
-            permissionOverwrites: c.permissionOverwrites.cache.map(o => ({
-                id: o.id,
-                type: o.type,
-                allow: o.allow.bitfield.toString(),
-                deny: o.deny.bitfield.toString()
-            }))
-        }))
-        .sort((a, b) => a.position - b.position);
-
-    const channels = guild.channels.cache
-        .filter(c => c.type !== ChannelType.GuildCategory)
-        .map(c => ({
-            id: c.id,
-            name: c.name,
-            type: c.type,
-            position: c.position,
-            parentId: c.parentId || null,
-            topic: c.topic || null,
-            nsfw: c.nsfw || false,
-            rateLimitPerUser: c.rateLimitPerUser || 0,
-            bitrate: c.bitrate || null,
-            userLimit: c.userLimit || null,
-            permissionOverwrites: c.permissionOverwrites.cache.map(o => ({
-                id: o.id,
-                type: o.type,
-                allow: o.allow.bitfield.toString(),
-                deny: o.deny.bitfield.toString()
-            }))
-        }))
-        .sort((a, b) => a.position - b.position);
-
-    backups[backupId] = {
-        id: backupId,
-        guildId: guild.id,
-        guildName: guild.name,
-        createdAt: Date.now(),
-        createdBy: user.id,
-        settings: {
-            name: guild.name,
-            verificationLevel: guild.verificationLevel,
-            explicitContentFilter: guild.explicitContentFilter,
-            defaultMessageNotifications: guild.defaultMessageNotifications,
-            afkTimeout: guild.afkTimeout
-        },
-        roles,
-        categories,
-        channels,
-        botConfig: {
-            WELCOME_CHANNEL_ID: CONFIG.WELCOME_CHANNEL_ID,
-            VERIFY_CHANNEL_ID: CONFIG.VERIFY_CHANNEL_ID,
-            VERIFY_ROLE_ID: CONFIG.VERIFY_ROLE_ID,
-            SNAP_CHANNEL_ID: CONFIG.SNAP_CHANNEL_ID,
-            SNAP_ROLE_ID: CONFIG.SNAP_ROLE_ID,
-            HONEYPOT_CHANNEL_ID: CONFIG.HONEYPOT_CHANNEL_ID,
-            HONEYPOT_LOG_ID: CONFIG.HONEYPOT_LOG_ID,
-            CALL_CHANNEL_ID: CONFIG.CALL_CHANNEL_ID,
-            CALL_CATEGORY_ID: CONFIG.CALL_CATEGORY_ID,
-            VERIFY_LOG_ID: CONFIG.VERIFY_LOG_ID,
-            SNAP_LOG_ID: CONFIG.SNAP_LOG_ID,
-            CALL_LOG_ID: CONFIG.CALL_LOG_ID,
-            JOIN_LEAVE_LOG_ID: CONFIG.JOIN_LEAVE_LOG_ID,
-            MEMBERS_LIST_CHANNEL_ID: CONFIG.MEMBERS_LIST_CHANNEL_ID,
-            CUSTOM_ROLE_PANEL_CHANNEL_ID: CONFIG.CUSTOM_ROLE_PANEL_CHANNEL_ID,
-            CUSTOM_ROLE_MANAGER_ROLE_ID: CONFIG.CUSTOM_ROLE_MANAGER_ROLE_ID,
-            GIVEAWAY_CHANNEL_ID: CONFIG.GIVEAWAY_CHANNEL_ID,
-            GIVEAWAY_LOG_ID: CONFIG.GIVEAWAY_LOG_ID,
-            ROLE_MANAGER_LOG_ID: CONFIG.ROLE_MANAGER_LOG_ID
-        },
-        customRoles: JSON.parse(JSON.stringify(customRoles))
-    };
+    // Correct
+    state.current = typedNumber;
+    state.lastUserId = message.author.id;
+    countingState[message.channel.id] = state;
     await saveToGist();
-    return backupId;
-}
-
-async function loadBackup(guild, backupId) {
-    const backup = backups[backupId];
-    if (!backup) throw new Error('Backup niet gevonden.');
-
-    const result = {
-        rolesCreated: 0,
-        rolesUpdated: 0,
-        categoriesCreated: 0,
-        channelsCreated: 0,
-        channelsUpdated: 0,
-        errors: []
-    };
-
-    const roleIdMap = new Map();
-    const sortedRoles = [...backup.roles].sort((a, b) => a.position - b.position);
-
-    for (const r of sortedRoles) {
-        try {
-            const existing = guild.roles.cache.get(r.id) || guild.roles.cache.find(x => x.name === r.name);
-            if (existing) {
-                await existing.edit({
-                    name: r.name,
-                    color: r.color,
-                    hoist: r.hoist,
-                    mentionable: r.mentionable,
-                    permissions: BigInt(r.permissions)
-                }).catch(err => result.errors.push(`Rol ${r.name}: ${err.message}`));
-                roleIdMap.set(r.id, existing.id);
-                result.rolesUpdated++;
-            } else {
-                const newRole = await guild.roles.create({
-                    name: r.name,
-                    color: r.color,
-                    hoist: r.hoist,
-                    mentionable: r.mentionable,
-                    permissions: BigInt(r.permissions),
-                    reason: 'Backup laden'
-                });
-                roleIdMap.set(r.id, newRole.id);
-                result.rolesCreated++;
-            }
-        } catch (err) {
-            result.errors.push(`Rol ${r.name}: ${err.message}`);
-        }
-    }
-
-    const categoryIdMap = new Map();
-    const sortedCategories = [...backup.categories].sort((a, b) => a.position - b.position);
-
-    for (const c of sortedCategories) {
-        try {
-            const overwrites = c.permissionOverwrites.map(o => ({
-                id: o.type === OverwriteType.Role ? (roleIdMap.get(o.id) || o.id) : o.id,
-                type: o.type,
-                allow: BigInt(o.allow),
-                deny: BigInt(o.deny)
-            }));
-
-            const existing = guild.channels.cache.get(c.id) || guild.channels.cache.find(x => x.name === c.name && x.type === ChannelType.GuildCategory);
-            if (existing) {
-                await existing.edit({
-                    name: c.name,
-                    permissionOverwrites: overwrites
-                }).catch(err => result.errors.push(`Categorie ${c.name}: ${err.message}`));
-                categoryIdMap.set(c.id, existing.id);
-            } else {
-                const newCat = await guild.channels.create({
-                    name: c.name,
-                    type: ChannelType.GuildCategory,
-                    permissionOverwrites: overwrites,
-                    reason: 'Backup laden'
-                });
-                categoryIdMap.set(c.id, newCat.id);
-                result.categoriesCreated++;
-            }
-        } catch (err) {
-            result.errors.push(`Categorie ${c.name}: ${err.message}`);
-        }
-    }
-
-    const channelIdMap = new Map();
-    const sortedChannels = [...backup.channels].sort((a, b) => a.position - b.position);
-
-    for (const c of sortedChannels) {
-        try {
-            const overwrites = c.permissionOverwrites.map(o => ({
-                id: o.type === OverwriteType.Role ? (roleIdMap.get(o.id) || o.id) : o.id,
-                type: o.type,
-                allow: BigInt(o.allow),
-                deny: BigInt(o.deny)
-            }));
-
-            const parentId = c.parentId ? (categoryIdMap.get(c.parentId) || c.parentId) : null;
-
-            const existing = guild.channels.cache.get(c.id) || guild.channels.cache.find(x => x.name === c.name && x.type === c.type);
-            if (existing) {
-                await existing.edit({
-                    name: c.name,
-                    parent: parentId,
-                    topic: c.topic || undefined,
-                    nsfw: c.nsfw,
-                    rateLimitPerUser: c.rateLimitPerUser,
-                    permissionOverwrites: overwrites
-                }).catch(err => result.errors.push(`Kanaal ${c.name}: ${err.message}`));
-                channelIdMap.set(c.id, existing.id);
-                result.channelsUpdated++;
-            } else {
-                const newCh = await guild.channels.create({
-                    name: c.name,
-                    type: c.type,
-                    parent: parentId,
-                    topic: c.topic || undefined,
-                    nsfw: c.nsfw,
-                    rateLimitPerUser: c.rateLimitPerUser,
-                    bitrate: c.bitrate || undefined,
-                    userLimit: c.userLimit || undefined,
-                    permissionOverwrites: overwrites,
-                    reason: 'Backup laden'
-                });
-                channelIdMap.set(c.id, newCh.id);
-                result.channelsCreated++;
-            }
-        } catch (err) {
-            result.errors.push(`Kanaal ${c.name}: ${err.message}`);
-        }
-    }
-
-    if (backup.botConfig) {
-        const mapKeys = [
-            'WELCOME_CHANNEL_ID', 'VERIFY_CHANNEL_ID', 'VERIFY_ROLE_ID',
-            'SNAP_CHANNEL_ID', 'SNAP_ROLE_ID', 'HONEYPOT_CHANNEL_ID', 'HONEYPOT_LOG_ID',
-            'CALL_CHANNEL_ID', 'CALL_CATEGORY_ID',
-            'VERIFY_LOG_ID', 'SNAP_LOG_ID', 'CALL_LOG_ID', 'JOIN_LEAVE_LOG_ID',
-            'MEMBERS_LIST_CHANNEL_ID', 'CUSTOM_ROLE_PANEL_CHANNEL_ID',
-            'CUSTOM_ROLE_MANAGER_ROLE_ID', 'GIVEAWAY_CHANNEL_ID',
-            'GIVEAWAY_LOG_ID', 'ROLE_MANAGER_LOG_ID'
-        ];
-        for (const key of mapKeys) {
-            const oldId = backup.botConfig[key];
-            if (!oldId) continue;
-            const newId = roleIdMap.get(oldId) || channelIdMap.get(oldId) || oldId;
-            CONFIG[key] = newId;
-        }
-    }
-
-    if (Array.isArray(backup.customRoles)) {
-        customRoles = backup.customRoles.map((c, i) => ({
-            ...c,
-            roleId: roleIdMap.get(c.roleId) || c.roleId,
-            order: i
-        }));
-    }
-
-    await saveToGist();
-    return result;
-}
-
-// --- CALL PANEL ---
-function buildCallPanel() {
-    const embed = new EmbedBuilder()
-        .setTitle('🔊 Calls')
-        .setDescription(
-            'Maak een call aan met de knop hieronder.\n\n' +
-            '**Openbaar** — iedereen met verify kan joinen.\n' +
-            '**Privé** — alleen jij kan mensen toelaten.\n\n' +
-            '**Kantoor** — stuur je eigen call-paneel opnieuw om mensen toe te voegen of te verwijderen.'
-        )
-        .setColor(PURPLE.main)
-        .setThumbnail(CONFIG.LOGO_URL);
-
-    const row = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setCustomId('call_open_public')
-            .setLabel('Openbaar')
-            .setEmoji('🔊')
-            .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-            .setCustomId('call_open_private')
-            .setLabel('Privé')
-            .setEmoji('🔒')
-            .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-            .setCustomId('call_office_panel')
-            .setLabel('Kantoor')
-            .setEmoji('📋')
-            .setStyle(ButtonStyle.Secondary)
-    );
-
-    return { embeds: [embed], components: [row] };
-}
-
-async function setupCallCategory(guild) {
-    try {
-        const category = guild.channels.cache.get(CONFIG.CALL_CATEGORY_ID);
-        if (!category) return console.log('Call categorie niet gevonden');
-        await category.permissionOverwrites.set([
-            { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-            { id: CONFIG.VERIFY_ROLE_ID, allow: [PermissionFlagsBits.ViewChannel] }
-        ]);
-        console.log('Call categorie rechten ingesteld');
-    } catch (err) {
-        console.error('Fout bij instellen call categorie:', err);
-    }
-}
-
-function buildCallInfoMessage(channelId, ownerId, isPrivate) {
-    const allowed = callAllowed.get(channelId) || new Set();
-
-    let allowedList = '_Niemand anders heeft toegang._';
-    if (allowed.size > 1) {
-        allowedList = Array.from(allowed)
-            .filter(id => id !== ownerId)
-            .map(id => `<@${id}>`)
-            .join('\n');
-    }
-
-    const embed = new EmbedBuilder()
-        .setTitle(isPrivate ? '🔒 Privé call aangemaakt' : '🔊 Openbare call aangemaakt')
-        .setDescription(
-            `**Eigenaar:** <@${ownerId}>\n` +
-            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n` +
-            `**Kanaal:** <#${channelId}>\n\n` +
-            `**Toegang:**\n${allowedList}\n\n` +
-            (isPrivate
-                ? 'Alleen jij kan mensen toelaten of verwijderen.'
-                : 'Iedereen met verify kan joinen.')
-        )
-        .setColor(PURPLE.main)
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
-
-    const rows = [];
-
-    if (isPrivate) {
-        rows.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`call_allow_${channelId}`)
-                    .setLabel('Iemand toelaten')
-                    .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success),
-                new ButtonBuilder()
-                    .setCustomId(`call_remove_${channelId}`)
-                    .setLabel('Iemand verwijderen')
-                    .setEmoji('➖')
-                    .setStyle(ButtonStyle.Secondary)
-            )
-        );
-    }
-
-    rows.push(
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(`call_hide_${channelId}`)
-                .setLabel('Verberg dit bericht')
-                .setEmoji('🙈')
-                .setStyle(ButtonStyle.Secondary),
-            new ButtonBuilder()
-                .setCustomId(`call_delete_${channelId}`)
-                .setLabel('Verwijder call')
-                .setEmoji('🗑️')
-                .setStyle(ButtonStyle.Danger)
-        )
-    );
-
-    return { embeds: [embed], components: rows };
-}
-
-function buildCallControlMessage(channelId, ownerId, isPrivate) {
-    const embed = new EmbedBuilder()
-        .setTitle(isPrivate ? '🔒 Privé call' : '🔊 Openbare call')
-        .setDescription(
-            `**Eigenaar:** <@${ownerId}>\n` +
-            `**Type:** ${isPrivate ? 'Privé' : 'Openbaar'}\n\n` +
-            (isPrivate
-                ? 'Alleen de eigenaar kan mensen toelaten of verwijderen via de knoppen hieronder.'
-                : 'Iedereen met verify kan joinen.')
-        )
-        .setColor(PURPLE.main)
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL });
-
-    const rows = [];
-
-    if (isPrivate) {
-        rows.push(
-            new ActionRowBuilder().addComponents(
-                new ButtonBuilder()
-                    .setCustomId(`call_allow_${channelId}`)
-                    .setLabel('Iemand toelaten')
-                    .setEmoji('✅')
-                    .setStyle(ButtonStyle.Success),
-                new ButtonBuilder()
-                    .setCustomId(`call_remove_${channelId}`)
-                    .setLabel('Iemand verwijderen')
-                    .setEmoji('➖')
-                    .setStyle(ButtonStyle.Secondary)
-            )
-        );
-    }
-
-    rows.push(
-        new ActionRowBuilder().addComponents(
-            new ButtonBuilder()
-                .setCustomId(`call_delete_${channelId}`)
-                .setLabel('Verwijder call')
-                .setEmoji('🗑️')
-                .setStyle(ButtonStyle.Danger)
-        )
-    );
-
-    return { embeds: [embed], components: rows };
-}
-
-async function updateCallControlMessage(channelId, ownerId, isPrivate) {
-    try {
-        const channel = await client.channels.fetch(channelId).catch(() => null);
-        if (!channel) return;
-
-        const controlId = callInfoMessages.get(channelId);
-        if (!controlId) return;
-
-        const msg = await channel.messages.fetch(controlId).catch(() => null);
-        if (!msg) return;
-
-        const payload = buildCallControlMessage(channelId, ownerId, isPrivate);
-        await msg.edit(payload).catch(() => {});
-    } catch (err) {
-        console.error('Fout bij updaten call control message:', err);
-    }
-}
-
-async function createCall(interaction, name, isPrivate) {
-    const guild = interaction.guild;
-    const member = interaction.member;
-    const prefix = isPrivate ? '🔒︱' : '🔊︱';
-    const channelName = `${prefix}${toFont(name)}`;
-
-    const overwrites = [
-        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-        {
-            id: CONFIG.VERIFY_ROLE_ID,
-            allow: [PermissionFlagsBits.ViewChannel],
-            deny: isPrivate ? [PermissionFlagsBits.Connect] : []
-        },
-        {
-            id: member.id,
-            allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.Connect,
-                PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.MoveMembers
-            ]
-        },
-        {
-            id: client.user.id,
-            allow: [
-                PermissionFlagsBits.ViewChannel,
-                PermissionFlagsBits.Connect,
-                PermissionFlagsBits.ManageChannels,
-                PermissionFlagsBits.MoveMembers
-            ]
-        }
-    ];
-
-    const channel = await guild.channels.create({
-        name: channelName,
-        type: ChannelType.GuildVoice,
-        parent: CONFIG.CALL_CATEGORY_ID,
-        permissionOverwrites: overwrites,
-        reason: `Call van ${member.user.tag}`
-    });
-
-    activeCalls.set(channel.id, {
-        ownerId: member.id,
-        isPrivate,
-        guildId: guild.id,
-        emptySince: Date.now()
-    });
-    callAllowed.set(channel.id, new Set([member.id]));
-
-    const controlMsg = await channel.send(buildCallControlMessage(channel.id, member.id, isPrivate)).catch(() => null);
-    if (controlMsg) {
-        callInfoMessages.set(channel.id, controlMsg.id);
-    }
-
-    const payload = buildCallInfoMessage(channel.id, member.id, isPrivate);
-    await interaction.editReply(payload).catch(() => {});
-
-    await sendLog(guild, CONFIG.CALL_LOG_ID, {
-        title: isPrivate ? '🔒 Privé call gemaakt' : '🔊 Openbare call gemaakt',
-        description: `**Eigenaar:** ${member.user.tag} (\`${member.id}\`)\n**Kanaal:** <#${channel.id}>`,
-        color: PURPLE.main,
-        thumbnail: member.user.displayAvatarURL({ dynamic: true, size: 128 })
-    });
+    await message.react('✅').catch(() => {});
 }
 
 // --- BOT ONLINE ---
@@ -1544,6 +1083,32 @@ client.once('clientReady', async () => {
         }
     } catch (err) {
         console.error('Fout bij call panel:', err);
+    }
+
+    // Counting game start bericht
+    try {
+        const countingChannel = await client.channels.fetch(CONFIG.COUNTING_CHANNEL_ID);
+        if (countingChannel) {
+            const current = countingState[countingChannel.id]?.current || 0;
+            const embed = new EmbedBuilder()
+                .setTitle('🔢 Tel-spel')
+                .setDescription(
+                    'Typ de getallen in volgorde: **1, 2, 3, 4, ...**\n\n' +
+                    '**Regels:**\n' +
+                    '• Je moet het juiste volgende getal typen.\n' +
+                    '• Je mag niet 2x achter elkaar typen.\n' +
+                    '• Typ je iets anders, dan begint het spel opnieuw bij 1.\n\n' +
+                    `**Huidige stand:** ${current}`
+                )
+                .setColor(PURPLE.main)
+                .setThumbnail(CONFIG.LOGO_URL)
+                .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
+                .setTimestamp();
+            await countingChannel.send({ embeds: [embed] }).catch(() => {});
+            console.log(`Tel-spel paneel gestuurd (stand: ${current})`);
+        }
+    } catch (err) {
+        console.error('Fout bij tel-spel paneel:', err);
     }
 
     await updateMembersList();
@@ -1842,6 +1407,11 @@ client.on('messageCreate', async (message) => {
         return;
     }
 
+    if (message.channel.id === CONFIG.COUNTING_CHANNEL_ID) {
+        await handleCountingMessage(message);
+        return;
+    }
+
     if (message.guild) {
         const protectedChannels = [
             CONFIG.HONEYPOT_CHANNEL_ID,
@@ -1854,7 +1424,8 @@ client.on('messageCreate', async (message) => {
             CONFIG.CUSTOM_ROLE_PANEL_CHANNEL_ID,
             CONFIG.GIVEAWAY_CHANNEL_ID,
             CONFIG.GIVEAWAY_LOG_ID,
-            CONFIG.ROLE_MANAGER_LOG_ID
+            CONFIG.ROLE_MANAGER_LOG_ID,
+            CONFIG.COUNTING_CHANNEL_ID
         ];
         if (!protectedChannels.includes(message.channel.id)) {
             const deleted = await handleAntiLink(message);
