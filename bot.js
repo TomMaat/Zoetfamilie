@@ -93,7 +93,7 @@ const CONFIG = {
 
     // CRASHER — terug naar 0.5 per tick, snel
     CRASHER_TICK_MS: 1000,
-    CRASHER_STEP: 0.05,
+    CRASHER_STEP: 0.1,
 
     // BALLOON — 10 stages met oplopende multipliers
     BALLOON_STAGES: [
