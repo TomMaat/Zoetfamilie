@@ -579,7 +579,7 @@ async function handleAntiLink(message) {
     } catch (err) { return true; }
 }
 
-// --- COUNTING ---
+// --- COUNTING (verwijdert GEEN getallen tijdens lopend spel) ---
 function buildCountingEmbed(state) {
     return new EmbedBuilder()
         .setTitle('🔢 Tel-spel')
@@ -659,28 +659,25 @@ async function handleCountingMessage(message) {
     };
 
     if (!match) {
-        await message.delete().catch(() => {});
         return reset(`${message.author} - Geen geldig getal. Opnieuw bij **1**.`);
     }
 
     const typed = parseInt(match[1], 10);
 
     if (state.lastUserId === message.author.id) {
-        await message.delete().catch(() => {});
         return reset(`${message.author} - Niet 2x achter elkaar. Opnieuw bij **1**.`);
     }
 
     if (typed !== state.current + 1) {
-        await message.delete().catch(() => {});
         return reset(`${message.author} - Fout! Je moest **${state.current + 1}** typen. Opnieuw bij **1**.`);
     }
 
+    // Geldige zet — bericht blijft staan, embed wordt geüpdatet
     state.current = typed;
     state.lastUserId = message.author.id;
     if (state.current > (state.highScore || 0)) state.highScore = state.current;
     countingState[message.channel.id] = state;
     await saveToGist();
-    await message.delete().catch(() => {});
     await updateCountingEmbed(state);
 }
 
@@ -701,7 +698,7 @@ function buildCasinoPanelEmbed() {
             '**Welkom in het casino!**\n\nIedereen begint met **100 chips**.\n\n' +
             '**Games:**\n• `/blackjack <inzet>`\n• `/roulette <inzet> <kleur>`\n• `/crasher <inzet>`\n\n' +
             '**Beloningen:**\n• Blackjack: 2x\n• Roulette rood/zwart: 2x\n• Roulette groen: 14x\n• Crasher: tot 25x (crash kan elk moment)\n\n' +
-            '💡 **Tip:** Bekijk je chips met `/chips`.'
+            '**Tip:** Bekijk je chips met `/chips`.'
         )
         .setColor(CASINO_GOLD).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 }
@@ -716,7 +713,7 @@ function buildCasinoLeaderboardEmbed() {
             body += `${medals[i] || `**${i + 1}.**`} <@${e.id}> — **${e.chips} chips**\n`;
         });
     }
-    return new EmbedBuilder().setTitle('🏆 Casino Leaderboard — Top 10').setDescription(`**Rijkste spelers:**\n\n${body}`).setColor(CASINO_GOLD).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
+    return new EmbedBuilder().setTitle('Casino Leaderboard — Top 10').setDescription(`**Rijkste spelers:**\n\n${body}`).setColor(CASINO_GOLD).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 }
 
 async function updateCasinoLeaderboard() {
@@ -761,21 +758,18 @@ async function updateCasinoPanel() {
     } catch (err) {}
 }
 
-// --- BLACKJACK (duidelijk & realistisch) ---
+// --- BLACKJACK ---
 const BJ_SUITS = ['♠️', '♥️', '♦️', '♣️'];
 const BJ_RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
 const bjDraw = () => ({ suit: BJ_SUITS[Math.floor(Math.random() * 4)], rank: BJ_RANKS[Math.floor(Math.random() * 13)] });
 const bjVal = (c) => c.rank === 'A' ? 11 : ['J', 'Q', 'K'].includes(c.rank) ? 10 : parseInt(c.rank, 10);
 const bjTotal = (h) => { let t = 0, a = 0; for (const c of h) { t += bjVal(c); if (c.rank === 'A') a++; } while (t > 21 && a > 0) { t -= 10; a--; } return t; };
-const bjCardStr = (c) => `\`${c.rank}${c.suit}\``;
 
-// Toon een hand als rij kaarten: [A♠️] [K♥️] [7♦️]
 function bjHandStr(hand) {
     if (!hand || hand.length === 0) return '_geen kaarten_';
     return hand.map(c => `\`${c.rank}${c.suit}\``).join(' ');
 }
 
-// Toon dealer hand: eerste kaart zichtbaar, rest verborgen
 function bjDealerHidden(dealer) {
     if (!dealer || dealer.length === 0) return '_geen kaarten_';
     const first = `\`${dealer[0].rank}${dealer[0].suit}\``;
@@ -787,51 +781,30 @@ function bjBuildEmbed(game, status, color, revealDealer = false) {
     const pt = bjTotal(game.player);
     const dt = bjTotal(game.dealer);
 
-    let dealerLine, dealerTotalLine;
+    let dealerLine, dealerTotal;
     if (revealDealer) {
         dealerLine = bjHandStr(game.dealer);
-        dealerTotalLine = `**${dt}**`;
+        dealerTotal = `${dt}`;
     } else {
         dealerLine = bjDealerHidden(game.dealer);
-        dealerTotalLine = `**${bjVal(game.dealer[0])}** + ?`;
+        dealerTotal = `${bjVal(game.dealer[0])} + ?`;
     }
 
-    const user = getCasinoUser(game.userId);
-
     return new EmbedBuilder()
-        .setTitle('🃏 Blackjack')
+        .setTitle('Blackjack')
         .setColor(color || CASINO_GOLD)
-        .setThumbnail(CONFIG.LOGO_URL)
         .addFields(
-            {
-                name: '🎩 Dealer',
-                value: `${dealerLine}\nTotaal: ${dealerTotalLine}`,
-                inline: false
-            },
-            {
-                name: `👤 Jouw hand (${pt})`,
-                value: bjHandStr(game.player),
-                inline: false
-            },
-            {
-                name: '💰 Inzet',
-                value: `**${game.bet} chips**\nBalans: **${user.chips} chips**`,
-                inline: true
-            },
-            {
-                name: '📊 Status',
-                value: status,
-                inline: true
-            }
-        )
-        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL })
-        .setTimestamp();
+            { name: 'Dealer', value: `${dealerLine}\nTotaal: **${dealerTotal}**`, inline: false },
+            { name: `Jouw hand (${pt})`, value: bjHandStr(game.player), inline: false },
+            { name: 'Inzet', value: `${game.bet} chips`, inline: true },
+            { name: 'Resultaat', value: status, inline: true }
+        );
 }
 
 function bjBuildRows(gameId) {
     return [new ActionRowBuilder().addComponents(
-        new ButtonBuilder().setCustomId(`bj_hit_${gameId}`).setLabel('Hit').setEmoji('🃏').setStyle(ButtonStyle.Primary),
-        new ButtonBuilder().setCustomId(`bj_stand_${gameId}`).setLabel('Stand').setEmoji('✋').setStyle(ButtonStyle.Success)
+        new ButtonBuilder().setCustomId(`bj_hit_${gameId}`).setLabel('Hit').setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`bj_stand_${gameId}`).setLabel('Stand').setStyle(ButtonStyle.Success)
     )];
 }
 
@@ -843,21 +816,20 @@ async function finishBlackjack(interaction, game, reason, isUpdate = false) {
     let result, payout, color;
 
     if (reason === 'player_blackjack') {
-        result = '🎉 **BLACKJACK!** Je wint 2x!';
+        result = '**BLACKJACK!** Je wint 2x.';
         payout = game.bet * 2;
         color = CASINO_GREEN;
     } else if (pt > 21) {
-        result = `💥 **Bust!** Je hebt **${pt}**. Je verliest.`;
+        result = `**Bust.** Je hebt **${pt}**. Je verliest.`;
         payout = 0;
         color = CASINO_RED;
     } else {
-        // Dealer hit tot >= 17
         while (bjTotal(game.dealer) < 17) game.dealer.push(bjDraw());
         const dt = bjTotal(game.dealer);
-        if (dt > 21) { result = `🎉 **Dealer bust!** Dealer heeft **${dt}**. Je wint!`; payout = game.bet * 2; color = CASINO_GREEN; }
-        else if (pt > dt) { result = `🎉 **Je wint!** Jij **${pt}** vs dealer **${dt}**.`; payout = game.bet * 2; color = CASINO_GREEN; }
-        else if (pt < dt) { result = `💀 **Je verliest.** Jij **${pt}** vs dealer **${dt}**.`; payout = 0; color = CASINO_RED; }
-        else { result = `🤝 **Push (gelijkspel).** Beide **${pt}**. Inzet terug.`; payout = game.bet; color = CASINO_GOLD; }
+        if (dt > 21) { result = `**Dealer bust** (${dt}). Je wint!`; payout = game.bet * 2; color = CASINO_GREEN; }
+        else if (pt > dt) { result = `**Je wint.** Jij **${pt}** vs dealer **${dt}**.`; payout = game.bet * 2; color = CASINO_GREEN; }
+        else if (pt < dt) { result = `**Je verliest.** Jij **${pt}** vs dealer **${dt}**.`; payout = 0; color = CASINO_RED; }
+        else { result = `**Gelijkspel.** Beide **${pt}**. Inzet terug.`; payout = game.bet; color = CASINO_GOLD; }
     }
 
     const user = getCasinoUser(game.userId);
@@ -881,11 +853,11 @@ async function finishBlackjack(interaction, game, reason, isUpdate = false) {
 async function playBlackjack(interaction, bet) {
     const user = getCasinoUser(interaction.user.id);
     if (user.chips <= 0) {
-        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setEmoji('🔄').setStyle(ButtonStyle.Success));
-        return interaction.reply({ content: '💸 Je hebt **0 chips**. Reset naar 100 chips.', components: [row], flags: MessageFlags.Ephemeral });
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setStyle(ButtonStyle.Success));
+        return interaction.reply({ content: 'Je hebt 0 chips. Reset naar 100 chips.', components: [row], flags: MessageFlags.Ephemeral });
     }
-    if (bet < 1) return interaction.reply({ content: '❌ Minstens **1 chip**.', flags: MessageFlags.Ephemeral });
-    if (bet > user.chips) return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
+    if (bet < 1) return interaction.reply({ content: 'Minstens 1 chip.', flags: MessageFlags.Ephemeral });
+    if (bet > user.chips) return interaction.reply({ content: `Je hebt maar ${user.chips} chips.`, flags: MessageFlags.Ephemeral });
 
     const player = [bjDraw(), bjDraw()];
     const dealer = [bjDraw(), bjDraw()];
@@ -902,7 +874,7 @@ async function playBlackjack(interaction, bet) {
     }
 
     await interaction.reply({
-        embeds: [bjBuildEmbed(game, 'Kies **Hit** of **Stand**', CASINO_GOLD)],
+        embeds: [bjBuildEmbed(game, 'Kies Hit of Stand.', CASINO_GOLD)],
         components: bjBuildRows(gameId)
     });
 }
@@ -920,7 +892,7 @@ async function handleBjHit(interaction, gameId) {
     if (pt === 21) return finishBlackjack(interaction, game, 'player_stand', true);
 
     return interaction.update({
-        embeds: [bjBuildEmbed(game, 'Kies **Hit** of **Stand**', CASINO_GOLD)],
+        embeds: [bjBuildEmbed(game, 'Kies Hit of Stand.', CASINO_GOLD)],
         components: bjBuildRows(gameId)
     });
 }
@@ -937,15 +909,15 @@ async function handleBjStand(interaction, gameId) {
 async function playRoulette(interaction, bet, choice) {
     const user = getCasinoUser(interaction.user.id);
     if (user.chips <= 0) {
-        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setEmoji('🔄').setStyle(ButtonStyle.Success));
-        return interaction.reply({ content: '💸 Je hebt **0 chips**. Reset naar 100 chips.', components: [row], flags: MessageFlags.Ephemeral });
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setStyle(ButtonStyle.Success));
+        return interaction.reply({ content: 'Je hebt 0 chips. Reset naar 100 chips.', components: [row], flags: MessageFlags.Ephemeral });
     }
-    if (bet < 1) return interaction.reply({ content: '❌ Minstens **1 chip**.', flags: MessageFlags.Ephemeral });
-    if (bet > user.chips) return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
+    if (bet < 1) return interaction.reply({ content: 'Minstens 1 chip.', flags: MessageFlags.Ephemeral });
+    if (bet > user.chips) return interaction.reply({ content: `Je hebt maar ${user.chips} chips.`, flags: MessageFlags.Ephemeral });
 
     const c = choice.toLowerCase();
     if (!['rood', 'zwart', 'groen'].includes(c)) {
-        return interaction.reply({ content: '❌ Kies rood, zwart of groen.', flags: MessageFlags.Ephemeral });
+        return interaction.reply({ content: 'Kies rood, zwart of groen.', flags: MessageFlags.Ephemeral });
     }
 
     user.chips -= bet;
@@ -958,18 +930,18 @@ async function playRoulette(interaction, bet, choice) {
     let result, payout, color;
     if (isGreen) {
         color = CASINO_GREEN;
-        result = `🟢 **${n} GROEN!**`;
-        if (c === 'groen') { payout = bet * 14; result += ' Je wint **14x**!'; }
+        result = `${n} GROEN!`;
+        if (c === 'groen') { payout = bet * 14; result += ' Je wint 14x!'; }
         else { payout = 0; result += ' Je verliest.'; color = CASINO_RED; }
     } else if (isRed) {
         color = CASINO_RED;
-        result = `🔴 **${n} ROOD!**`;
-        if (c === 'rood') { payout = bet * 2; result += ' Je wint **2x**!'; color = CASINO_GREEN; }
+        result = `${n} ROOD!`;
+        if (c === 'rood') { payout = bet * 2; result += ' Je wint 2x!'; color = CASINO_GREEN; }
         else { payout = 0; result += ' Je verliest.'; }
     } else {
         color = '#2b2b2b';
-        result = `⚫ **${n} ZWART!**`;
-        if (c === 'zwart') { payout = bet * 2; result += ' Je wint **2x**!'; color = CASINO_GREEN; }
+        result = `${n} ZWART!`;
+        if (c === 'zwart') { payout = bet * 2; result += ' Je wint 2x!'; color = CASINO_GREEN; }
         else { payout = 0; result += ' Je verliest.'; }
     }
 
@@ -983,15 +955,15 @@ async function playRoulette(interaction, bet, choice) {
     await saveToGist();
 
     const embed = new EmbedBuilder()
-        .setTitle('🎡 Roulette')
+        .setTitle('Roulette')
         .setDescription(
-            `${result}\n\n` +
+            `**${result}**\n\n` +
             `**Jouw keuze:** ${c}\n` +
             `**Inzet:** ${bet} chips\n` +
             `**Uitbetaling:** ${payout} chips\n` +
             `**Nieuwe balans:** ${newChips} chips`
         )
-        .setColor(color).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
+        .setColor(color).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 
     await interaction.reply({ embeds: [embed] });
     await updateCasinoLeaderboard();
@@ -1001,27 +973,27 @@ async function playRoulette(interaction, bet, choice) {
 // --- CRASHER ---
 function buildCrasherEmbed(game, multiplier, status, color) {
     return new EmbedBuilder()
-        .setTitle('🚀 Crasher')
+        .setTitle('Crasher')
         .setDescription(
             `**Inzet:** ${game.bet} chips\n**Huidige multiplier:** **${multiplier.toFixed(2)}x**\n**Mogelijke winst:** ${Math.floor(game.bet * multiplier)} chips\n\n${status}`
         )
         .setColor(color || (multiplier >= 2 ? CASINO_GREEN : CASINO_GOLD))
-        .setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
+        .setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 }
 
 function buildCrasherRows(gameId, active) {
     if (!active) return [];
-    return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`crash_cashout_${gameId}`).setLabel('Cash Out').setEmoji('💰').setStyle(ButtonStyle.Success))];
+    return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`crash_cashout_${gameId}`).setLabel('Cash Out').setStyle(ButtonStyle.Success))];
 }
 
 async function playCrasher(interaction, bet) {
     const user = getCasinoUser(interaction.user.id);
     if (user.chips <= 0) {
-        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setEmoji('🔄').setStyle(ButtonStyle.Success));
-        return interaction.reply({ content: '💸 Je hebt **0 chips**. Reset naar 100 chips.', components: [row], flags: MessageFlags.Ephemeral });
+        const row = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('casino_reset').setLabel('Reset naar 100 chips').setStyle(ButtonStyle.Success));
+        return interaction.reply({ content: 'Je hebt 0 chips. Reset naar 100 chips.', components: [row], flags: MessageFlags.Ephemeral });
     }
-    if (bet < 1) return interaction.reply({ content: '❌ Minstens **1 chip**.', flags: MessageFlags.Ephemeral });
-    if (bet > user.chips) return interaction.reply({ content: `❌ Je hebt maar **${user.chips} chips**.`, flags: MessageFlags.Ephemeral });
+    if (bet < 1) return interaction.reply({ content: 'Minstens 1 chip.', flags: MessageFlags.Ephemeral });
+    if (bet > user.chips) return interaction.reply({ content: `Je hebt maar ${user.chips} chips.`, flags: MessageFlags.Ephemeral });
 
     user.chips -= bet;
     await saveToGist();
@@ -1049,7 +1021,7 @@ async function playCrasher(interaction, bet) {
             u.losses += 1;
             u.gamesPlayed += 1;
             await saveToGist();
-            await message.edit({ embeds: [buildCrasherEmbed(game, game.multiplier, `💥 **CRASH!** De multiplier klapte op **${game.crashPoint.toFixed(2)}x**. Je verliest **${game.bet} chips**.`, CASINO_RED)], components: [] }).catch(() => {});
+            await message.edit({ embeds: [buildCrasherEmbed(game, game.multiplier, `**CRASH!** De multiplier klapte op **${game.crashPoint.toFixed(2)}x**. Je verliest **${game.bet} chips**.`, CASINO_RED)], components: [] }).catch(() => {});
             await updateCasinoLeaderboard();
             await updateCasinoPanel();
         } else {
@@ -1071,7 +1043,7 @@ async function handleCrashCashout(interaction, gameId) {
     u.wins += 1;
     u.gamesPlayed += 1;
     await saveToGist();
-    await interaction.update({ embeds: [buildCrasherEmbed(game, game.multiplier, `💰 **Cash Out!** Je wint **${winnings} chips** op **${game.multiplier.toFixed(2)}x**!`, CASINO_GREEN)], components: [] });
+    await interaction.update({ embeds: [buildCrasherEmbed(game, game.multiplier, `**Cash Out!** Je wint **${winnings} chips** op **${game.multiplier.toFixed(2)}x**!`, CASINO_GREEN)], components: [] });
     await updateCasinoLeaderboard();
     await updateCasinoPanel();
 }
@@ -1079,16 +1051,16 @@ async function handleCrashCashout(interaction, gameId) {
 // --- GIVEAWAY ---
 function buildGiveawayEmbed(gw) {
     return new EmbedBuilder()
-        .setTitle(gw.ended ? '🎉 Giveaway afgelopen' : '🎉 Giveaway')
+        .setTitle(gw.ended ? 'Giveaway afgelopen' : 'Giveaway')
         .setDescription(
             `**Prijs:** ${gw.prize}\n\n` +
             (gw.ended ? `**Winnaar(s):** ${gw.winners?.map(id => `<@${id}>`).join(', ') || '_Geen deelnemers_'}` : `**Eindigt:** <t:${Math.floor(gw.endsAt / 1000)}:R>\n**Deelnemers:** ${gw.participants.length}`)
         )
-        .setColor(PURPLE.main).setThumbnail(CONFIG.LOGO_URL).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
+        .setColor(PURPLE.main).setFooter({ text: CONFIG.SERVER_NAME, iconURL: CONFIG.LOGO_URL }).setTimestamp();
 }
 function buildGiveawayRows(messageId, ended) {
-    if (!ended) return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw_join_${messageId}`).setLabel('Deelnemen').setEmoji('🎉').setStyle(ButtonStyle.Success))];
-    return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw_reroll_${messageId}`).setLabel('Reroll').setEmoji('🔁').setStyle(ButtonStyle.Primary))];
+    if (!ended) return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw_join_${messageId}`).setLabel('Deelnemen').setStyle(ButtonStyle.Success))];
+    return [new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId(`gw_reroll_${messageId}`).setLabel('Reroll').setStyle(ButtonStyle.Primary))];
 }
 async function startGiveawayTimer(messageId) {
     const gw = giveaways[messageId];
@@ -1115,13 +1087,13 @@ async function endGiveaway(messageId) {
         const channel = await client.channels.fetch(gw.channelId);
         const msg = await channel.messages.fetch(messageId);
         await msg.edit({ embeds: [buildGiveawayEmbed(gw)], components: buildGiveawayRows(messageId, true) });
-        if (gw.winners.length > 0) await channel.send(`🎉 Gefeliciteerd ${gw.winners.map(id => `<@${id}>`).join(', ')}! Je hebt **${gw.prize}** gewonnen.`);
-        else await channel.send(`😢 Niemand deed mee aan de giveaway voor **${gw.prize}**.`);
+        if (gw.winners.length > 0) await channel.send(`Gefeliciteerd ${gw.winners.map(id => `<@${id}>`).join(', ')}! Je hebt **${gw.prize}** gewonnen.`);
+        else await channel.send(`Niemand deed mee aan de giveaway voor **${gw.prize}**.`);
     } catch (err) {}
     const guild = client.guilds.cache.first();
     if (guild) {
         await sendLog(guild, CONFIG.GIVEAWAY_LOG_ID, {
-            title: '🏁 Giveaway afgelopen',
+            title: 'Giveaway afgelopen',
             description: `**Prijs:** ${gw.prize}\n**Winnaar(s):** ${gw.winners.length > 0 ? gw.winners.map(id => `<@${id}>`).join(', ') : '_Geen deelnemers_'}\n**Deelnemers:** ${gw.participants.length}`,
             color: PURPLE.dark
         });
@@ -1142,7 +1114,7 @@ async function handleGiveawayButton(interaction) {
             const msg = await channel.messages.fetch(messageId);
             await msg.edit({ embeds: [buildGiveawayEmbed(gw)], components: buildGiveawayRows(messageId, false) });
         } catch (err) {}
-        return interaction.reply({ content: '🎉 Je doet mee!', flags: MessageFlags.Ephemeral });
+        return interaction.reply({ content: 'Je doet mee!', flags: MessageFlags.Ephemeral });
     }
     if (customId.startsWith('gw_reroll_')) {
         const messageId = customId.replace('gw_reroll_', '');
